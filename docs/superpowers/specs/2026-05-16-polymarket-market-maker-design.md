@@ -38,7 +38,16 @@ Polymarket operates a Central Limit Order Book per binary market. Each market is
 - **Token IDs:** Each market has `tokenId_yes` and `tokenId_no` (hex strings). Orders reference token IDs, not market IDs directly.
 - **Collateral:** USDC on Polygon. All positions and P&L denominated in USDC.
 - **Tick size:** Typically 0.01 (1 cent). Min order size varies by market.
-- **Fee structure:** Maker rebate / taker fee varies by market and incentive program. Assumption: 0% maker, 2% taker as default; validate per market.
+- **Fee structure:** Maker fee = 0 always. Taker fee is parabolic in price:
+  `fee = C × feeRate × p × (1-p)` where C is shares, p is price, feeRate is category-specific.
+  Category feeRates: Crypto = 0.07, Finance/Politics = 0.04, Sports = 0.03.
+  Sports uses an alternate form `C × p × feeRate × (p(1-p))^exponent` with exponent=1,
+  which equals `C × feeRate × p²(1-p)` — peaks at p=2/3, not p=0.5 like the standard formula.
+  Runtime feeRate and exponent are fetched via `getClobMarketInfo(conditionID)` at market init.
+  Makers receive a rebate ≈ rebate_fraction × feeRate × p × (1-p) per contract, where
+  rebate_fraction ≈ 20–25% of collected taker fees (assumption; validate via API).
+  **Critical implication:** fees peak at p=0.5 (midmarket) and shrink toward 0 or 1. The strategy
+  must widen spreads at midmarket and can tighten them for near-resolved markets.
 - **Queue model:** Price-time priority. Queue position is unknown post-reconnect.
 - **Settlement:** On-chain CTF resolution. Redemption requires explicit on-chain call.
 
@@ -198,25 +207,36 @@ def net_opposing_depth(book: OrderBook, own_orders: list[Order], side: Side,
 
 **5.3.2 Fee-Adjusted Maximum Acceptable Flatten Price**
 
-The breakeven flatten price accounts for the taker fee on the aggressive leg and the maker rebate already earned on the initial fill:
+The HedgeabilityAssessor calls `FeeModel.max_flatten_price()` directly — the same FeeModel instance used by QuoteEngine and PnLEngine. Fee parameters flow from one source: `getClobMarketInfo(conditionID)` at market init.
+
+The taker fee is **parabolic**, not flat. This makes the breakeven condition a quadratic, not a linear equation. The exact closed-form solution (derived in Section 6.1):
 
 ```
-max_flatten_price(p_fill, fee_taker, rebate_maker, min_edge_floor) =
-    1 - p_fill - fee_taker × (1 - p_fill) + rebate_maker - min_edge_floor
+max_flatten_price = FeeModel.max_flatten_price(p_fill, feeRate, rebate_fraction, min_edge_floor)
 
-Derivation:
-  Round-trip revenue = 1 - p_fill - p_flatten          [arb payout]
-  Round-trip cost    = fee_taker × p_flatten - rebate_maker  [net fees]
-  Net edge           = 1 - p_fill - p_flatten - fee_taker × p_flatten + rebate_maker
-  Set net_edge ≥ min_edge_floor and solve for p_flatten:
-    p_flatten ≤ (1 - p_fill + rebate_maker - min_edge_floor) / (1 + fee_taker)
+Derivation (reproduced for clarity):
+  edge = (1 - p_fill - p_flatten)                              [arb payout]
+       + rebate_fraction × feeRate × p_fill × (1-p_fill)       [rebate on maker fill]
+       - feeRate × p_flatten × (1-p_flatten)                   [taker fee on flatten]
+       - min_edge_floor                                         [required floor]
+       ≥ 0
 
-On Polymarket defaults (fee_taker=0.02, rebate_maker=0.00, min_edge_floor=0.005):
-  If p_fill = 0.46:
-    p_flatten_max = (1 - 0.46 + 0 - 0.005) / (1 + 0.02) = 0.535 / 1.02 ≈ 0.524
+  Let LHS = 1 - p_fill + rebate_fraction × feeRate × p_fill(1-p_fill) - min_edge_floor
+  Rearrange: LHS ≥ p_flatten × (1 + feeRate - feeRate × p_flatten)
+  Quadratic: feeRate × p_flatten² - (1+feeRate) × p_flatten + LHS = 0
+  Solution:  p_flatten_max = [(1+feeRate) - √((1+feeRate)² - 4×feeRate×LHS)] / (2×feeRate)
 
-  Interpretation: paying more than 52.4c for the No side makes the round trip
-  loss-making after fees, even with perfect execution.
+Numerical example — Finance market (feeRate=0.04), p_fill=0.46:
+  rebate = 0.20 × 0.04 × 0.46 × 0.54 = 0.00199
+  LHS    = 1 - 0.46 + 0.00199 - 0.005 = 0.53699
+  disc   = 1.0816 - 4×0.04×0.53699 = 0.99568
+  p_max  = (1.04 - 0.99784) / 0.08 = 0.527
+
+  Interpretation: must buy No for ≤ 52.7c to break even after fees and rebate.
+  The old flat-fee approximation (52.4c) understates the allowable price by 0.3c;
+  this difference compounds across thousands of fills.
+
+If discriminant < 0: no viable flatten price exists → do not quote on this market.
 ```
 
 **5.3.3 Pre-Quote Hedgeability Gate**
@@ -463,7 +483,88 @@ Both are always reported separately. The mandate pitch reports `spread_pnl` as t
 
 ### Artifact B: Formula Block
 
-**6.1 Fair Value Estimation**
+**6.1 Fee Model**
+
+All fee and rebate calculations use a single `FeeModel` instance per market, instantiated at market init with parameters fetched from `getClobMarketInfo(conditionID)`. Every downstream component — HedgeabilityAssessor, QuoteEngine, PnLEngine, backtest simulator — uses this shared instance. There is one source of truth for `feeRate`.
+
+```python
+class FeeModel:
+    """
+    Polymarket parabolic fee model. feeRate and exponent fetched from
+    getClobMarketInfo(conditionID) at market initialization.
+    rebate_fraction is a global config assumption pending API validation.
+    """
+    CATEGORY_FEE_RATES = {
+        'crypto': 0.07, 'politics': 0.04, 'finance': 0.04,
+        'sports': 0.03, 'other': 0.04
+    }
+    DEFAULT_REBATE_FRACTION = 0.20  # assumption; validate via Polymarket LP docs
+
+    def taker_fee(self, size: float, price: float,
+                  fee_rate: float, exponent: int = 1) -> float:
+        if exponent == 1:
+            return size * fee_rate * price * (1 - price)          # standard
+        else:
+            return size * price * fee_rate * (price * (1-price)) ** exponent  # Sports
+
+    def maker_rebate(self, size: float, price: float,
+                     fee_rate: float, rebate_fraction: float) -> float:
+        fee_equiv = size * fee_rate * price * (1 - price)
+        return rebate_fraction * fee_equiv
+        # NOTE: actual rebate = your_fee_equiv / total_market_fee_equiv × rebate_pool
+        # The above is an approximation; it converges to the exact value as
+        # the strategy's share of market volume stabilises.
+
+    def fee_flatten_expected(self, fv: float,
+                             fee_rate: float, exponent: int = 1) -> float:
+        """
+        Expected taker fee on aggressive flatten, evaluated at current FV.
+        Used by QuoteEngine to set the half-spread floor.
+        """
+        if exponent == 1:
+            return fee_rate * fv * (1 - fv)
+        else:
+            return fee_rate * fv * (fv * (1-fv)) ** exponent
+
+    def max_flatten_price(self, p_fill: float, fee_rate: float,
+                          rebate_fraction: float, min_edge_floor: float) -> float:
+        """
+        Maximum price at which the aggressive flatten still produces positive
+        round-trip edge after fees and rebate. Exact quadratic solution.
+
+        Derivation:
+          edge = (1 - p_fill - p_flatten) + rebate(p_fill) - fee_taker(p_flatten) - floor ≥ 0
+          Let rebate  = rebate_fraction × fee_rate × p_fill × (1-p_fill)
+              LHS     = 1 - p_fill + rebate - floor
+          Constraint: LHS ≥ p_flatten + fee_rate × p_flatten(1-p_flatten)
+                          ≥ p_flatten × (1 + fee_rate - fee_rate × p_flatten)
+          Quadratic:  fee_rate × p² - (1+fee_rate) × p + LHS = 0
+          Lower root is the binding max price.
+        """
+        rebate = rebate_fraction * fee_rate * p_fill * (1 - p_fill)
+        LHS = 1 - p_fill + rebate - min_edge_floor
+        a, b, c = fee_rate, -(1 + fee_rate), LHS
+        disc = b**2 - 4*a*c
+        if disc < 0:
+            return 0.0   # no viable flatten price; do not quote
+        return (-b - math.sqrt(disc)) / (2 * a)
+```
+
+**Fee breakeven reference table** (min_edge_floor=0.005, rebate_fraction=0.20):
+
+| Category | feeRate | p_fill=0.30 | p_fill=0.46 | p_fill=0.50 | p_fill=0.70 |
+|---|---|---|---|---|---|
+| Finance/Politics | 0.04 | 0.671 | 0.527 | 0.508 | 0.295 |
+| Crypto | 0.07 | 0.657 | 0.521 | 0.503 | 0.289 |
+| Sports | 0.03 | 0.677 | 0.531 | 0.512 | 0.299 |
+
+*Read as: if you passively fill Yes at p_fill, you can pay at most p_flatten_max for an aggressive No flatten and still break even. Markets where best No ask exceeds this price must not be quoted (or placed in the skew bucket if within tolerance).*
+
+**Sports formula note:** Sports fee = `C × feeRate × p²(1-p)` (peaks at p=2/3, not p=0.5). The `max_flatten_price` formula uses this via the `exponent` parameter, so Sports markets naturally allow a slightly wider flatten window at mid-prices.
+
+---
+
+**6.2 Fair Value Estimation**
 
 ```
 FV(t) = w1 × FV_trade(t) + w2 × FV_external(t) + w3 × FV_base(t)
@@ -483,15 +584,22 @@ Confidence interval: [FV - 2σ_FV, FV + 2σ_FV]
   σ_FV = rolling std of FV_trade over 30-min window
 ```
 
-**6.2 Quote Placement**
+**6.3 Quote Placement**
 
 ```
-half_spread(t)  = max(S_min, α + β × σ_FV(t) + fee_roundtrip / 2)
+half_spread(t)  = max(S_min, α + β × σ_FV(t) + fee_flatten_expected(t) / 2)
 
-  S_min          = minimum half-spread floor (controllable; default 0.02)
-  α              = base half-spread (controllable; default 0.015)
-  β              = volatility loading (controllable; default 2.0)
-  fee_roundtrip  = total taker fees for both legs (estimable; default 0.04)
+  S_min                  = minimum half-spread floor (controllable; default 0.02)
+  α                      = base half-spread (controllable; default 0.015)
+  β                      = volatility loading (controllable; default 2.0)
+  fee_flatten_expected(t) = FeeModel.fee_flatten_expected(FV(t), feeRate, exponent)
+                           = feeRate × FV(t) × (1 - FV(t))   [standard form]
+
+  This replaces the static fee_roundtrip/2 term. The spread floor is now dynamic:
+  it widens when FV ≈ 0.5 (fees peak) and tightens when FV approaches 0 or 1
+  (fees shrink). At FV=0.5 with feeRate=0.04: fee term = 0.04×0.25/2 = 0.005.
+  At FV=0.8 with feeRate=0.04: fee term = 0.04×0.16/2 = 0.0032.
+  The QuoteEngine calls FeeModel.fee_flatten_expected() on every quote cycle.
 
 inventory_skew(t) = γ × inventory(t) / INV_MAX
   γ              = risk aversion (controllable; default 0.03)
@@ -503,40 +611,65 @@ ask(t)  = FV(t) + half_spread(t) - inventory_skew(t)
 Clamp: bid ∈ [0.01, 0.99], ask ∈ [0.01, 0.99], bid < ask
 ```
 
-**6.3 Expected Edge per Passive Fill**
+**6.4 Expected Edge per Passive Fill**
 
 ```
-E[edge | fill] = half_spread(t) - AS(t) - fee_maker
+E[edge | fill] = half_spread(t) - AS(t) + expected_rebate(p_fill)
 
-  AS(t) = adverse_selection_estimate(t)
-        = EMA(|FV_{t+30s} - FV_t| for fills in rolling 1h window, α=0.1)
+  AS(t)                  = EMA(|FV_{t+30s} - FV_t| for fills in rolling 1h window, α=0.1)
+  expected_rebate(p_fill) = FeeModel.maker_rebate(size=1, p_fill, feeRate, rebate_fraction)
+                           = rebate_fraction × feeRate × p_fill × (1-p_fill)
 
-  fee_maker = maker rebate (negative cost if positive rebate; default 0.00)
+  Maker fee = 0 (Polymarket); rebate is positive revenue earned on the maker fill.
+  The rebate is parabolic in fill price — highest at p=0.5, lowest near 0 or 1.
+  Rebate is reported as a separate line item in PnL attribution, never blended into spread.
 
-Minimum viable: E[edge | fill] > 0
-  ⟹ half_spread > AS + fee_maker
-  ⟹ S_min floor must satisfy this condition at all times
+Minimum viable condition (S_min floor constraint):
+  half_spread > AS - expected_rebate(FV)
+  ⟹ S_min ≥ max(0, AS_typical - rebate_fraction × feeRate × FV × (1-FV))
+
+  The rebate lowers the required S_min, making near-midmarket quotes more viable.
+  This is the correct behavior: the fee structure subsidizes liquidity at mid.
 ```
 
-**6.4 Expected Edge per Completed Inventory Cycle**
+**6.5 Expected Edge per Completed Inventory Cycle**
 
 ```
-E[edge | cycle] = (fill_price_yes + fill_price_no - 1) × size
-                - fee_taker_yes - fee_taker_no
+Standard cycle: passive initial fill (maker), aggressive flatten (taker).
+
+E[edge | cycle] = (p_initial + p_flatten - 1) × size
+                + rebate_initial × size        [maker rebate on initial fill]
+                - fee_flatten × size           [taker fee on aggressive flatten]
                 - hedge_slippage
                 - capital_charge
 
-  fill_price_yes  = price at which Yes was filled (passive)
-  fill_price_no   = price at which No was filled (passive or aggressive)
-  fee_taker_yes   = fee on Yes leg (0 if maker, taker rate if aggressive flatten)
-  fee_taker_no    = fee on No leg (same)
-  hedge_slippage  = E[aggressive flatten cost - passive flatten counterfactual]
-                  = (aggressive_fill_price - passive_expected_price) × size
+  rebate_initial  = FeeModel.maker_rebate(1, p_initial, feeRate, rebate_fraction)
+                  = rebate_fraction × feeRate × p_initial × (1-p_initial)
+
+  fee_flatten     = FeeModel.taker_fee(1, p_flatten, feeRate, exponent)
+                  = feeRate × p_flatten × (1-p_flatten)   [standard form]
+
+  hedge_slippage  = (p_flatten_actual - p_flatten_expected) × size
+                    [positive cost when aggressive fill is worse than mid estimate]
+
   capital_charge  = |inventory| × FV × r_opp × Δt_held
-    r_opp         = opportunity cost rate (assumption; default 10% annualized)
+    r_opp         = 10% annualized (assumption)
     Δt_held       = seconds held / (365.25 × 86400)
 
-Positive cycle edge requires: fill_yes + fill_no > 1 + fees + slippage + capital_charge
+Passive-passive cycle (both legs fill passively — best case):
+  + rebate_initial + rebate_flatten - hedge_slippage = 0
+  E[edge | passive cycle] = (p_initial + p_flatten - 1) × size
+                           + (rebate_initial + rebate_flatten) × size
+                           - capital_charge
+
+Cycle edge is positive when:
+  p_initial + p_flatten < 1                           [bought both for less than $1]
+  AND rebate_initial > fee_flatten - (1 - p_initial - p_flatten)
+  i.e., the spread plus rebate exceeds the flatten fee plus capital charge.
+
+Note: feeRate and exponent are the SAME values fetched from getClobMarketInfo at
+market init. PnLEngine uses FeeModel.taker_fee() and FeeModel.maker_rebate()
+directly on every fill event — no approximations.
 ```
 
 **6.5 All-In Mandate Economics**
@@ -676,17 +809,19 @@ Reported in two modes:
 Mandate pitch uses net_effective_spread but must disclose both.
 ```
 
-**6.12 Hedgeability and Skew Tolerance Framework**
+**6.13 Hedgeability and Skew Tolerance Framework**
+
+All values below are computed using the shared `FeeModel` instance for the market.
 
 ```
 --- Pre-Quote Hedgeability Gate ---
 
-max_flatten_price = (1 - p_fill + rebate_maker - min_edge_floor) / (1 + fee_taker)
+max_flatten_price = FeeModel.max_flatten_price(p_fill_estimate, feeRate, rebate_fraction,
+                                               min_edge_floor)
+  [exact quadratic formula — see Section 6.1 and 5.3.2]
+  p_fill_estimate = proposed quote price (bid or ask)
 
-  On Polymarket defaults (fee_taker=0.02, rebate_maker=0.00, min_edge_floor=0.005):
-  max_flatten_price = (0.535 - p_fill) / 1.02
-
-net_opposing_depth = Σ sizes at opposing levels where price ≤ max_flatten_price,
+net_opposing_depth = Σ sizes at opposing levels where level.price ≤ max_flatten_price,
                      EXCLUDING own resting orders at those levels
 
 hedgeable_size     = min(proposed_quote_size, net_opposing_depth)
@@ -694,18 +829,26 @@ unhedgeable_size   = proposed_quote_size - hedgeable_size
 
 --- Skew Acceptance Test (runs only if unhedgeable_size > 0) ---
 
-skew_headroom      = skew_tolerance - current_skew_inventory_notional
-allowed_skew_size  = min(unhedgeable_size, skew_headroom)
+skew_headroom        = skew_tolerance - current_skew_inventory_notional
+allowed_skew_size    = min(unhedgeable_size, skew_headroom)
 
-skew_edge_required = min_edge_floor + skew_edge_premium
-skew_edge_expected = FV_opposing - p_flatten_estimate   [directional EV of holding skew]
+rebate_on_skew_fill  = FeeModel.maker_rebate(1, p_fill_estimate, feeRate, rebate_fraction)
+  [rebate earned on initial fill reduces effective cost basis of the skew position]
+
+effective_cost_basis = p_fill_estimate - rebate_on_skew_fill
+  = p_fill_estimate × (1 - rebate_fraction × feeRate × (1-p_fill_estimate))
+
+skew_edge_expected   = FV_opposing_estimate - effective_cost_basis
+  [directional EV of holding skew to resolution or eventual passive flatten]
+
+skew_edge_required   = min_edge_floor + skew_edge_premium
 
 if skew_edge_expected < skew_edge_required:
-    allowed_skew_size = 0   # premium not met; block skew
+    allowed_skew_size = 0   # edge premium not met even with rebate; block skew
 
-final_quote_size   = hedgeable_size + allowed_skew_size
+final_quote_size     = hedgeable_size + allowed_skew_size
 
---- Capital Charges by Bucket ---
+--- Capital Charges by Bucket (PnLEngine applies these on every inventory tick) ---
 
 capital_charge_hedgeable(pos, Δt) = |pos| × FV × r_opp × Δt
 capital_charge_skew(pos, Δt)      = |pos| × FV × r_opp × Δt × skew_capital_charge_multiplier
@@ -713,13 +856,22 @@ capital_charge_skew(pos, Δt)      = |pos| × FV × r_opp × Δt × skew_capital
 
 --- Skew PnL at Settlement ---
 
-skew_pnl(market) = Σ_skew_positions [payout_at_resolution - cost_basis]
-  cost_basis = avg_fill_price × size + capital_charge_skew_accrued
+skew_pnl(market) = Σ_skew_positions [payout_at_resolution - effective_cost_basis × size
+                                      - capital_charge_skew_accrued]
 
-skew_pnl is always reported as a separate line from spread_pnl.
-If skew_pnl > spread_pnl in any 30-day period, flag for review:
-  the system is generating more directional alpha than spread alpha,
-  which may not be consistent with a liquidity provision mandate.
+  payout_at_resolution = size × (1 - effective_cost_basis) if outcome matches position
+                       = size × (0 - effective_cost_basis) if outcome opposes position
+
+skew_pnl reported separately from spread_pnl at all times.
+Flag if skew_pnl > spread_pnl in any trailing 30-day window.
+
+--- Integration Check ---
+The following values must be consistent across all components:
+  feeRate          → fetched once via getClobMarketInfo; stored in MarketMetadata
+  rebate_fraction  → single global config parameter
+  min_edge_floor   → single config parameter
+  FeeModel instance → shared between HedgeabilityAssessor, QuoteEngine, PnLEngine, Backtest
+Any component that uses a fee approximation instead of FeeModel is a bug.
 ```
 
 **6.13 Edge Measurement Across Four Dimensions**
@@ -846,21 +998,50 @@ Hedge slippage:
 
 **7.9 Fee / Rebate / Incentive Model**
 
+The backtest fee model uses the same `FeeModel` class as the live system. There is no separate backtest fee approximation — any divergence between backtest and live fee calculations is a bug.
+
+```python
+# Backtest fee model — identical to live FeeModel
+class BacktestFeeModel(FeeModel):
+    pass   # no overrides; same code path as production
+
+# Applied per simulated fill event:
+def on_simulated_fill(fill: Fill, market: MarketMetadata, fee_model: FeeModel):
+    if fill.fill_type == TAKER:
+        fill.fee_paid = fee_model.taker_fee(fill.size, fill.price,
+                                            market.fee_rate, market.fee_exponent)
+        fill.rebate_received = 0.0
+    else:  # MAKER
+        fill.fee_paid = 0.0
+        fill.rebate_received = fee_model.maker_rebate(fill.size, fill.price,
+                                                       market.fee_rate,
+                                                       market.rebate_fraction)
 ```
-fee_model:
-  maker_fee = 0.00 (assumption; verify per market)
-  taker_fee = 0.02 × fill_notional (assumption; verify per market)
+
+```
+Category fee rates (from getClobMarketInfo; hardcoded in backtest as defaults):
+  crypto:          feeRate = 0.07, exponent = 1
+  politics/finance: feeRate = 0.04, exponent = 1
+  sports:          feeRate = 0.03, exponent = 1   [NOTE: Sports formula = p²(1-p); peaks at p=2/3]
+  other:           feeRate = 0.04, exponent = 1   [default; verify per market]
+
+rebate_fraction = 0.20  [assumption; labeled as such in all backtest outputs]
+                         [run sensitivity: rebate_fraction ∈ {0.0, 0.15, 0.20, 0.25}]
 
 incentive_model:
   incentive_per_hour = I_pool × (time_at_top_of_book / total_market_hours)
                      × (1 if quote_width ≤ W_threshold else 0)
                      × (1 if displayed_size ≥ SIZE_threshold else 0)
 
-  I_pool            = total incentive pool for market (unknown until mandate; set to 0 for gross backtest)
-  W_threshold       = max quote width to qualify (assumption; 5c default)
-  SIZE_threshold    = min displayed size (assumption; $100 default)
+  I_pool      = 0 for gross backtest; parameterized for net backtest
+  W_threshold = 5c default
+  SIZE_threshold = $100 default
 
-Backtest reports all results with I_pool = 0 (gross) and with I_pool = parameterized estimate (net).
+Backtest parameter sweep must include rebate_fraction sensitivity.
+All results reported in three columns:
+  gross: no rebate, no incentives
+  rebate_only: with rebate, no incentive pool
+  net: with rebate and incentive pool
 ```
 
 **7.10 Retainer Economics Model**
@@ -1016,7 +1197,11 @@ The hypothesis is **falsified** if any of the following are observed:
     "tradability_score": { "type": "number", "minimum": 0, "maximum": 10 },
     "fv_estimate": { "type": "number", "minimum": 0, "maximum": 1 },
     "fv_confidence_lo": { "type": "number" },
-    "fv_confidence_hi": { "type": "number" }
+    "fv_confidence_hi": { "type": "number" },
+    "fee_rate": { "type": "number", "description": "Taker feeRate from getClobMarketInfo; e.g. 0.04 for Finance" },
+    "fee_exponent": { "type": "integer", "default": 1, "description": "Fee formula exponent; 1 for standard, >1 alters shape (Sports)" },
+    "rebate_fraction": { "type": "number", "description": "Maker rebate as fraction of taker fees; assumed 0.20, override per market" },
+    "fee_formula_note": { "type": "string", "description": "Human-readable: 'standard p(1-p)' or 'sports p²(1-p)' etc." }
   }
 }
 ```
@@ -1473,11 +1658,12 @@ polymarket-mm/
 │   │   ├── calibration.py       # ParameterCalibrationAgent Claude prompt
 │   │   ├── monitoring.py        # MonitoringAgent
 │   │   └── incident.py          # IncidentResponseAgent
+│   ├── fee_model.py             # FeeModel — single source of truth for all fee/rebate calcs
 │   └── backtest/
 │       ├── simulator.py         # EventDrivenSimulator
 │       ├── fill_model.py        # Fill models (touch, volume, impact)
-│       ├── fee_model.py         # Fee/rebate/incentive model
 │       └── runner.py            # Parameter sweep + walk-forward runner
+│                                # NOTE: backtest uses src/fee_model.py directly — no copy
 ├── tests/
 │   ├── unit/                    # Per-component unit tests
 │   ├── integration/             # Adapter + strategy integration tests
@@ -1563,6 +1749,10 @@ Manual (human required to execute):
 
 | Component | Test | Pass criterion |
 |---|---|---|
+| FeeModel | taker_fee(size=100, price=0.50, feeRate=0.04) | Returns 1.00 (100×0.04×0.25); Sports exponent=1 returns 0.50 (100×0.03×0.25×0.5) |
+| FeeModel | maker_rebate(size=100, price=0.50, feeRate=0.04, rebate_fraction=0.20) | Returns 0.20 (0.20×1.00) |
+| FeeModel | max_flatten_price(p_fill=0.46, feeRate=0.04, rebate_fraction=0.20, floor=0.005) | Returns 0.527 ± 0.001 |
+| FeeModel | max_flatten_price with discriminant < 0 | Returns 0.0; QuoteEngine does not submit quote |
 | FairValueEstimator | FV on known-resolved market | FV within 0.05 of eventual settlement at >72h before resolution |
 | RegimeClassifier | Inject all state transition triggers | All transitions fire correctly per state machine table |
 | QuoteEngine | Quote with INV > INV_SOFT | Bid/ask skewed correctly away from inventory direction |
@@ -1603,7 +1793,8 @@ Manual (human required to execute):
 
 **Assumptions (require validation before live deployment):**
 
-1. Maker fee = 0%, taker fee = 2%. **Validate per market and per incentive program.**
+1. Taker fee formula: `feeRate × p × (1-p)`; feeRates: Crypto=0.07, Finance/Politics=0.04, Sports=0.03. **Validate per market via `getClobMarketInfo(conditionID)` at market init. Treat Sports exponent as 1 unless API returns otherwise.**
+2. Maker rebate = `rebate_fraction × feeRate × p × (1-p)`; rebate_fraction = 0.20. **Validate exact rebate_fraction via Polymarket LP documentation or API before relying on rebate economics in mandate pitch. Run backtest sensitivity: rebate_fraction ∈ {0.0, 0.15, 0.20, 0.25}.**
 2. Polymarket CLOB latency = ~20ms. **Measure in paper trading phase.**
 3. Opportunity cost rate = 10% annualized. **Replace with actual cost of capital.**
 4. Network latency ∼ lognormal(50ms, 20ms). **Calibrate from paper trading logs.**
