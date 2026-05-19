@@ -101,3 +101,11 @@ def test_settled_overrides_one_side_filled():
     inv = InventoryState("m1", hedgeable_contracts=50.0, skew_contracts=0.0, avg_fill_price=0.46)
     inp = make_input(inventory=inv, time_to_resolution_hours=0.0)
     assert clf.classify(inp) == Regime.SETTLED
+
+
+def test_settled_overrides_suspended():
+    # When both conditions are true (time=0 AND high adverse selection),
+    # SETTLED takes precedence. Once resolved, AS detection is moot.
+    clf = RegimeClassifier()
+    inp = make_input(time_to_resolution_hours=0.0, adverse_selection=0.020)
+    assert clf.classify(inp) == Regime.SETTLED

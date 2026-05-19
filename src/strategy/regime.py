@@ -1,9 +1,14 @@
 """
-RegimeClassifier — deterministic 7-state lifecycle machine.
+RegimeClassifier — deterministic 7-state machine.
 
-Priority order (highest to lowest):
-  SUSPENDED > SETTLED > HEDGE_PENDING > INVENTORY_WAREHOUSE
+Implemented priority order (highest to lowest):
+  SETTLED > SUSPENDED > HEDGE_PENDING > INVENTORY_WAREHOUSE
   > INVENTORY_REDUCED > ONE_SIDE_FILLED > QUOTE_ACTIVE
+
+Note: SETTLED takes absolute precedence over SUSPENDED because once a market
+has resolved (time_to_resolution_hours <= 0), adverse selection detection is
+moot — the market no longer accepts orders. This is a deliberate deviation
+from a strict "adverse-selection-always-wins" policy.
 """
 
 from __future__ import annotations
@@ -50,13 +55,13 @@ class RegimeClassifier:
         if inp.adverse_selection > inp.adverse_selection_threshold:
             return Regime.SUSPENDED
 
-        # 3. Pre-resolution hedge window
-        if inp.time_to_resolution_hours <= inp.pre_resolution_hours:
-            if inp.inventory.total_contracts() > 0:
-                return Regime.HEDGE_PENDING
-
         total = inp.inventory.total_contracts()
         fraction = total / inp.max_inventory_contracts if inp.max_inventory_contracts > 0 else 0.0
+
+        # 3. Pre-resolution hedge window
+        if inp.time_to_resolution_hours <= inp.pre_resolution_hours:
+            if total > 0:
+                return Regime.HEDGE_PENDING
 
         # 4. Inventory warehouse (near hard limit)
         if fraction >= inp.warehouse_threshold_fraction:
