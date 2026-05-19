@@ -1,60 +1,125 @@
 #!/usr/bin/env python3
 """
-Download historical trade data from Polymarket APIs and save as JSONL.
+Download historical trade data from Polymarket and save as JSONL.
 
-Usage:
-    python scripts/ingest_history.py --market CONDITION_ID --out data/raw/ --days 30
+Usage — pass anything from the browser URL bar:
+    py scripts/ingest_history.py --market "polymarket.com/sports/epl/epl-bou-mac-2026-05-19"
+    py scripts/ingest_history.py --market "epl-bou-mac-2026-05-19"
+    py scripts/ingest_history.py --market "0xabc123..."
 
-Endpoints used:
-  GET https://gamma-api.polymarket.com/markets?conditionId={condition_id}
-      -> get token_id (for output filename) and market metadata
-  GET https://data-api.polymarket.com/trades?market={condition_id}&limit=500
-      -> public endpoint, no auth required, returns all trades for a market
+The script auto-detects whether you passed a URL, slug, or condition ID
+and resolves everything automatically — no manual ID lookup needed.
 
-Note: Polymarket does not provide full historical order book snapshots via public API.
-The ingestion stores trade events. For higher-fidelity backtesting, use the WebSocket
-feed captured in real-time.
+Optional flags:
+    --out data/raw      output directory (default: data/raw)
+    --days 30           days of history to download (default: 30)
 """
 
 import argparse
 import json
-import os
+import re
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
 
-try:
-    from dotenv import load_dotenv, find_dotenv
-    load_dotenv(find_dotenv(usecwd=True))
-except ImportError:
-    pass  # dotenv optional
-
-DATA_API  = "https://data-api.polymarket.com"
+DATA_API   = "https://data-api.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
 
-def fetch_market_info(condition_id: str) -> dict:
-    url = f"{GAMMA_BASE}/markets?conditionId={condition_id}"
-    r = requests.get(url, timeout=10)
+# ---------------------------------------------------------------------------
+# Market resolution: URL / slug / condition ID -> (condition_id, token_id, title)
+# ---------------------------------------------------------------------------
+
+def resolve_market(market_input: str) -> tuple[str, str, str]:
+    """
+    Accept any of:
+      - Full URL:      https://polymarket.com/sports/epl/epl-bou-mac-2026-05-19
+      - Bare URL:      polymarket.com/sports/epl/epl-bou-mac-2026-05-19
+      - Slug:          epl-bou-mac-2026-05-19
+      - Condition ID:  0xabc123...
+
+    Returns (condition_id, token_id, title).
+    """
+    raw = market_input.strip().rstrip("/")
+
+    # Already a condition ID
+    if re.match(r"^0x[0-9a-fA-F]{10,}$", raw):
+        return _resolve_by_condition_id(raw)
+
+    # URL or slug — take the last path segment
+    slug = raw.split("/")[-1].split("?")[0]
+    return _resolve_by_slug(slug)
+
+
+def _resolve_by_slug(slug: str) -> tuple[str, str, str]:
+    # Try events endpoint first (sports events have multiple sub-markets)
+    r = requests.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=10)
+    r.raise_for_status()
+    events = r.json()
+
+    if events:
+        event = events[0]
+        markets = event.get("markets", [])
+        if markets:
+            m = markets[0]
+            condition_id = m.get("conditionId", "")
+            token_id = _extract_token_id(m)
+            title = event.get("title", slug)
+            if condition_id:
+                return condition_id, token_id, title
+
+    # Fall back to markets endpoint
+    r = requests.get(f"{GAMMA_BASE}/markets", params={"slug": slug}, timeout=10)
+    r.raise_for_status()
+    markets = r.json()
+
+    if not markets:
+        raise ValueError(
+            f"No market found for '{slug}'.\n"
+            f"Check that the URL is from polymarket.com and the market is still active."
+        )
+
+    m = markets[0]
+    condition_id = m.get("conditionId", "")
+    token_id = _extract_token_id(m)
+    title = m.get("question", slug)
+
+    if not condition_id:
+        raise ValueError(f"Could not find conditionId for slug '{slug}'.")
+
+    return condition_id, token_id, title
+
+
+def _resolve_by_condition_id(condition_id: str) -> tuple[str, str, str]:
+    r = requests.get(f"{GAMMA_BASE}/markets", params={"conditionId": condition_id}, timeout=10)
     r.raise_for_status()
     data = r.json()
     if not data:
         raise ValueError(f"No market found for conditionId={condition_id}")
-    # Filter to find the exact market (API may return a whole event group)
     needle = condition_id.lower()
-    for m in data:
-        if m.get("conditionId", "").lower() == needle:
-            return m
-    return data[0]
+    m = next((x for x in data if x.get("conditionId", "").lower() == needle), data[0])
+    return condition_id, _extract_token_id(m), m.get("question", condition_id)
 
+
+def _extract_token_id(market: dict) -> str:
+    raw = market.get("clobTokenIds") or market.get("clob_token_ids") or ""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return raw
+    if isinstance(raw, list) and raw:
+        return raw[0]
+    return market.get("conditionId", "")
+
+
+# ---------------------------------------------------------------------------
+# Trade fetching (public endpoint — no auth required)
+# ---------------------------------------------------------------------------
 
 def fetch_trades(condition_id: str, token_id: str, days: int, out_path: Path) -> int:
-    """
-    Fetch all public trades for `condition_id` from data-api.polymarket.com.
-    No authentication required.
-    """
     since = datetime.now(timezone.utc) - timedelta(days=days)
     since_ts = int(since.timestamp())
     offset = 0
@@ -80,22 +145,22 @@ def fetch_trades(condition_id: str, token_id: str, days: int, out_path: Path) ->
 
                 stop_early = False
                 for trade in trades:
-                    # timestamp is a Unix float/int in this API
-                    raw_ts = trade.get("timestamp", 0)
-                    trade_ts = int(float(raw_ts))
+                    trade_ts = int(float(trade.get("timestamp", 0)))
                     if trade_ts < since_ts:
                         stop_early = True
                         break
 
                     event = {
                         "event_type": "trade",
-                        "market_id": token_id,   # use token_id as market_id for loader compatibility
+                        "market_id": token_id,
                         "fill_id": trade.get("transactionHash", f"tx_{total}"),
-                        "timestamp": datetime.fromtimestamp(trade_ts, tz=timezone.utc).isoformat(),
+                        "timestamp": datetime.fromtimestamp(
+                            trade_ts, tz=timezone.utc
+                        ).isoformat(),
                         "side": trade.get("side", "BUY").upper(),
                         "price": float(trade.get("price", 0)),
                         "size": float(trade.get("size", 0)),
-                        "is_maker": False,  # data API does not distinguish maker/taker
+                        "is_maker": False,
                     }
                     f.write(json.dumps(event) + "\n")
                     total += 1
@@ -114,33 +179,39 @@ def fetch_trades(condition_id: str, token_id: str, days: int, out_path: Path) ->
     return total
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main():
-    parser = argparse.ArgumentParser(description="Ingest Polymarket historical trade data")
-    parser.add_argument("--market", required=True, help="Condition ID (from market URL)")
-    parser.add_argument("--out", default="data/raw", help="Output directory")
-    parser.add_argument("--days", type=int, default=30, help="Days of history to fetch")
+    parser = argparse.ArgumentParser(
+        description="Ingest Polymarket trade history",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Pass any Polymarket URL, slug, or condition ID to --market.",
+    )
+    parser.add_argument(
+        "--market", required=True,
+        help='Polymarket URL, slug, or condition ID  '
+             '(e.g. "polymarket.com/sports/epl/epl-bou-mac-2026-05-19")',
+    )
+    parser.add_argument("--out", default="data/raw", help="Output directory (default: data/raw)")
+    parser.add_argument("--days", type=int, default=30, help="Days of history (default: 30)")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Fetching market info for {args.market}...")
-    info = fetch_market_info(args.market)
-    raw_tokens = info.get("clobTokenIds") or info.get("clob_token_ids")
-    if not raw_tokens:
-        raise ValueError(f"No token ID found for {args.market}")
-    if isinstance(raw_tokens, str):
-        raw_tokens = json.loads(raw_tokens)
-    token_id = raw_tokens[0]
-    if not token_id:
-        raise ValueError(f"No token ID found for {args.market}")
+    print(f"Resolving: {args.market}")
+    condition_id, token_id, title = resolve_market(args.market)
 
-    print(f"Token ID:   {token_id}")
-    print(f"Market:     {info.get('question', args.market)}")
+    print(f"  Market:       {title}")
+    print(f"  Condition ID: {condition_id}")
+    print(f"  Token ID:     {token_id}")
+
     out_path = out_dir / f"{token_id}.jsonl"
+    print(f"\nDownloading {args.days} days of trades -> {out_path}")
 
-    print(f"Downloading {args.days} days of trades -> {out_path}")
-    n = fetch_trades(args.market, token_id, args.days, out_path)
+    n = fetch_trades(condition_id, token_id, args.days, out_path)
     print(f"Done. {n} trade events written to {out_path}")
 
 
