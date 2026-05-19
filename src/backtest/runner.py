@@ -120,8 +120,16 @@ class BacktestRunner:
         pnl_engine = PnLEngine(fm, cfg.fee_rate, cfg.rebate_fraction)
 
         # 5. Create BacktestSimulator
+        try:
+            queue_model_enum = QueueModel[cfg.queue_model]
+        except KeyError:
+            raise ValueError(
+                f"Invalid queue_model {cfg.queue_model!r}. "
+                f"Valid values: {[m.name for m in QueueModel]}"
+            ) from None
+
         fill_model = FillModel(FillModelConfig(
-            queue_model=QueueModel[cfg.queue_model],
+            queue_model=queue_model_enum,
             latency_ms=cfg.latency_ms,
         ))
 

@@ -78,3 +78,17 @@ def test_runner_num_book_updates_positive(run_config):
     runner = BacktestRunner(run_config)
     result = runner.run()
     assert result.num_book_updates >= 1
+
+
+def test_runner_rejects_invalid_queue_model(data_dir):
+    cfg = RunConfig(
+        market_id="test-001",
+        data_dir=str(data_dir),
+        fee_rate=0.04,
+        fee_exponent=1,
+        rebate_fraction=0.20,
+        sports=False,
+        queue_model="INVALID",
+    )
+    with pytest.raises(ValueError):
+        BacktestRunner(cfg).run()
