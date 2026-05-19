@@ -27,7 +27,6 @@ from src.strategy.quote_engine import QuoteEngine, QuoteInput
 from src.strategy.inventory import InventoryManager
 from src.pnl import PnLEngine, CompletedCycle
 from src.backtest.fill_model import FillModel, FillModelInput
-from src.backtest.adverse_selection import AdverseSelectionTracker
 
 
 Event = Union[OrderBook, Fill]
@@ -44,9 +43,6 @@ class SimulatorConfig:
     warehouse_threshold_fraction: float = 0.80
     daily_capital_charge_rate: float = 0.0003
     resolution_time: Optional[datetime] = None  # if set, compute time_to_resolution dynamically
-    adverse_selection_window_seconds: float = 300.0   # seconds to wait before measuring AS
-    adverse_selection_adverse_threshold: float = 0.005  # minimum price drop to count as adverse
-    quote_staleness_threshold: float = 0.0  # 0 = disabled; e.g. 0.01 = skip if FV moved >1 cent
 
 
 @dataclass
@@ -59,30 +55,9 @@ class SimulationResult:
     num_book_updates: int = 0
     num_cycles_completed: int = 0
     num_open_positions: int = 0
-    # Extended analytics (added fields — all default to zero/empty for backward compatibility)
-    num_profitable_cycles: int = 0          # cycles with net_pnl > 0
-    hedge_accessible_count: int = 0         # quote attempts where hedge depth was found
-    hedge_checks_total: int = 0             # total hedge checks (FV available + book present)
-    per_cycle_pnl: list = field(default_factory=list)  # net PnL per completed cycle
-    # Adverse selection metrics
-    as_events_measured: int = 0         # fills that completed their AS measurement window
-    as_rate: float = 0.0                # fraction of measured fills that were adverse (all-time)
-    num_stale_quote_skips: int = 0          # fill checks skipped due to stale FV
 
     def total_pnl(self) -> float:
         return self.total_spread_pnl + self.total_skew_pnl
-
-    def win_rate(self) -> float:
-        """Fraction of completed cycles that were profitable."""
-        if self.num_cycles_completed == 0:
-            return 0.0
-        return self.num_profitable_cycles / self.num_cycles_completed
-
-    def hedge_accessibility(self) -> float:
-        """Fraction of quoting opportunities that had hedgeable depth."""
-        if self.hedge_checks_total == 0:
-            return 0.0
-        return self.hedge_accessible_count / self.hedge_checks_total
 
 
 @dataclass
@@ -124,22 +99,12 @@ class BacktestSimulator:
         self._pending_entry: _PendingEntry | None = None
         self._as_estimate: float = 0.0
         self._result: SimulationResult = SimulationResult()
-        self._as_tracker: AdverseSelectionTracker = AdverseSelectionTracker(
-            window_seconds=config.adverse_selection_window_seconds,
-            adverse_threshold=config.adverse_selection_adverse_threshold,
-        )
-        self._last_fv: float | None = None     # FV at last fill-check (for staleness)
 
     def run(self, events: list[Event]) -> SimulationResult:
         self._result = SimulationResult()
         self._current_book = None
         self._pending_entry = None
         self._as_estimate = 0.0
-        self._as_tracker = AdverseSelectionTracker(
-            window_seconds=self.config.adverse_selection_window_seconds,
-            adverse_threshold=self.config.adverse_selection_adverse_threshold,
-        )
-        self._last_fv = None
         for event in events:
             if isinstance(event, OrderBook):
                 self._on_book(event)
@@ -150,11 +115,6 @@ class BacktestSimulator:
         if self._pending_entry is not None:
             self._result.num_open_positions = 1  # pending but unclosed
             # Don't call compute_settlement — resolution price unknown in backtest
-
-        # Finalize AS stats
-        as_stats = self._as_tracker.stats()
-        self._result.as_events_measured = as_stats["num_measured"]
-        self._result.as_rate = as_stats["as_rate"]
 
         return self._result
 
@@ -173,56 +133,31 @@ class BacktestSimulator:
     def _on_trade(self, trade: Fill) -> None:
         """Process a market trade observation.
 
-        Correct real-world ordering:
-        1. Check fills/flattens against CURRENT resting-order prices (pre-trade FV).
-        2. THEN update FV with the incoming trade price.
-
-        A resting order is posted at a fixed price computed from FV *before* this trade
-        arrives. Checking fills after absorbing the trade would use a stale price.
+        1. Update FV estimator.
+        2. If we have a pending entry, also check whether this trade can flatten it.
+        3. Derive strategy quotes and check if the trade would fill our resting bid.
         """
-        # 1a. Try to flatten an existing pending position via this trade (pre-FV-update)
-        if self._pending_entry is not None and self._current_book is not None:
-            self._attempt_flatten_via_trade(trade)
-
-        # 1b. If no pending position, check whether this trade fills our resting bid.
-        if self._pending_entry is None and self._current_book is not None:
-            fv = self.fv_estimator.estimate(as_of=trade.timestamp)
-            if fv is not None:
-                self._check_fill(trade, fv)
-
-        # 2. Update fair-value estimator AFTER fill check (correct information order)
+        # 1. Update fair-value estimator with every market trade
         self.fv_estimator.on_trade(
             TradeObservation(price=trade.price, size=trade.size, timestamp=trade.timestamp)
         )
 
-        # 3. Advance AS tracker with the new price; update running estimate
-        self._as_tracker.on_trade(trade.price, trade.timestamp)
-        self._as_estimate = self._as_tracker.estimate()
+        # 2. Try to flatten an existing pending position via this trade
+        if self._pending_entry is not None and self._current_book is not None:
+            self._attempt_flatten_via_trade(trade)
 
-    def _check_fill(self, trade: Fill, fv: float) -> None:
-        """Check whether a market trade fills our resting bid (pre-FV-update state)."""
-        decision = self._compute_quote(fv, trade.timestamp)
-
-        # Staleness check: if FV has jumped more than threshold since last fill-check,
-        # our resting quote would have been pulled before this trade arrived.
-        # _last_fv is reset to the current fv after a stale skip, so only the
-        # first trade after a large FV jump is skipped — subsequent trades are
-        # evaluated fresh against the updated baseline.
-        if (
-            self.config.quote_staleness_threshold > 0.0
-            and self._last_fv is not None
-            and abs(fv - self._last_fv) > self.config.quote_staleness_threshold
-        ):
-            self._result.num_stale_quote_skips += 1
-            self._last_fv = fv
+        # 3. Only try to acquire new positions if no position is pending
+        if self._pending_entry is not None:
             return
-        self._last_fv = fv
 
-        # Track quoting opportunity accessibility: count how often the quote engine
-        # produced a non-zero bid (hedge available OR skew accepted).
-        self._result.hedge_checks_total += 1
-        if decision is not None and not decision.suspend and decision.bid_size > 0:
-            self._result.hedge_accessible_count += 1
+        if self._current_book is None:
+            return
+
+        fv = self.fv_estimator.estimate(as_of=trade.timestamp)
+        if fv is None:
+            return
+
+        decision = self._compute_quote(fv, trade.timestamp)
         if decision is None or decision.suspend or decision.bid_size == 0:
             return
 
@@ -264,8 +199,6 @@ class BacktestSimulator:
         )
         self.inventory_manager.add_fill(sim_fill, is_skew=is_skew)
         self._pending_entry = _PendingEntry(fill=sim_fill, is_skew=is_skew)
-        # Record fill in AS tracker
-        self._as_tracker.on_fill(sim_fill.price, sim_fill.timestamp)
 
     # ------------------------------------------------------------------
     # Quote computation helpers
@@ -295,12 +228,8 @@ class BacktestSimulator:
         regime = self.regime_classifier.classify(regime_inp)
 
         # Provisional bid price for hedgeability check.
-        # Use fee-adjusted half-spread (same formula as QuoteEngine) so the hedgeability
-        # threshold matches the actual bid price the engine will compute.
-        fee_cost = self.fee_model.fee_flatten_expected(fv, self.hedgeability_assessor.fee_rate)
-        actual_half_spread = max(self.quote_engine.half_spread_base,
-                                 fee_cost + self.quote_engine.min_edge_floor)
-        provisional_bid = fv - actual_half_spread
+        # Uses half_spread_base as approximation; actual bid may differ by regime/fee adjustment.
+        provisional_bid = fv - self.quote_engine.half_spread_base
         hedge_result = self._assess_hedgeability(provisional_bid, self.config.quote_size)
 
         quote_inp = QuoteInput(
@@ -400,15 +329,11 @@ class BacktestSimulator:
             is_skew=self._pending_entry.is_skew if self._pending_entry else False,
         )
         cycle_result = self.pnl_engine.compute_cycle(cycle)
-        net_cycle_pnl = cycle_result.spread_pnl + cycle_result.skew_pnl
         self._result.total_spread_pnl += cycle_result.spread_pnl
         self._result.total_skew_pnl += cycle_result.skew_pnl
         self._result.total_fees_paid += cycle_result.taker_fee_paid
         self._result.total_rebates_received += cycle_result.maker_rebate_received
         self._result.num_cycles_completed += 1
-        self._result.per_cycle_pnl.append(net_cycle_pnl)
-        if net_cycle_pnl > 0:
-            self._result.num_profitable_cycles += 1
 
         self.inventory_manager.add_flatten(flatten_size, flatten_price)
         self._pending_entry = None

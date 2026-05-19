@@ -23,8 +23,12 @@ polymarket-mm/data/
 market-regime-system/data/
 market-regime-system/venv/
 
-# Claude Code worktrees (managed separately by git worktree, not tracked in main branch)
+# Claude Code worktrees and local settings (managed separately)
 .claude/worktrees/
+.claude/settings.local.json
+
+# Separate git repositories (not submodules)
+market-regime-system/
 
 # OS
 .DS_Store
