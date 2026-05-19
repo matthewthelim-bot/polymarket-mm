@@ -94,7 +94,10 @@ def test_max_flatten_price_no_fill_above_1(fm):
     assert p_max <= 1.0
 
 
-def test_max_flatten_price_returns_zero_on_impossible(fm):
+def test_max_flatten_price_clamped_to_zero_when_edge_impossible(fm):
+    # With an absurdly large min_edge_floor, the lower root goes negative.
+    # The function clamps to 0.0 via max(0.0, p_max).
+    # (The discriminant is actually positive here — it's the clamping that fires.)
     p_max = fm.max_flatten_price(
         p_fill=0.50, fee_rate=0.04, rebate_fraction=0.20, min_edge_floor=0.90
     )
@@ -106,4 +109,6 @@ def test_max_flatten_price_is_above_p_fill_for_yes_buy(fm):
     p_max = fm.max_flatten_price(
         p_fill=p_fill, fee_rate=0.04, rebate_fraction=0.20, min_edge_floor=0.005
     )
-    assert p_max < 1 - p_fill + 0.05
+    # For a Yes buy at 0.46, the No side ceiling should be just above 0.46
+    # and well below 0.54 (= 1 - p_fill). Tight range: [0.47, 0.53]
+    assert 0.47 < p_max < 0.53

@@ -27,10 +27,20 @@ class FeeModel:
         """
         Taker fee for a fill of `size` contracts at `price`.
 
-        Standard formula:  size * fee_rate * price * (1 - price)
-        Sports formula:    size * fee_rate * price^2 * (1 - price)
-            equivalently:  size * price * fee_rate * (price * (1 - price))^exponent
-            with exponent=1, which peaks at p=2/3 not p=0.5.
+        Standard formula (sports=False):  size * fee_rate * price * (1 - price)
+          Note: `exponent` is ignored when sports=False. All current Polymarket
+          non-sports categories use the standard formula regardless of exponent.
+
+        Sports formula (sports=True):  size * price * fee_rate * (price * (1 - price))^exponent
+          With exponent=1, this equals size * fee_rate * price^2 * (1-price),
+          which peaks at p=2/3, not p=0.5 like the standard formula.
+
+        Args:
+            size: number of contracts
+            price: fill price in [0, 1]
+            fee_rate: category fee rate (Crypto=0.07, Finance/Politics=0.04, Sports=0.03)
+            exponent: only used when sports=True; 1 for all current Polymarket categories
+            sports: if True, use sports variant p^2*(1-p)
         """
         if sports:
             return size * price * fee_rate * (price * (1 - price)) ** exponent
@@ -86,7 +96,13 @@ class FeeModel:
             rebate = rebate_fraction * fee_rate * p_fill * (1 - p_fill)
             LHS    = 1 - p_fill + rebate - min_edge_floor
 
-        Returns 0.0 if discriminant < 0 (no valid price exists).
+        Note: always uses the standard (non-sports) fee formula for the flatten leg,
+        regardless of what formula was used on the fill side.
+
+        The `discriminant < 0` guard is defensive for out-of-range inputs; in practice
+        with valid Polymarket prices the clamp `max(0.0, ...)` is what triggers for
+        impossible cases (the lower quadratic root goes negative before the discriminant
+        does).
         """
         rebate = rebate_fraction * fee_rate * p_fill * (1 - p_fill)
         lhs = 1 - p_fill + rebate - min_edge_floor
