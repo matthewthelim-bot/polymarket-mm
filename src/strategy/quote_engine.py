@@ -22,7 +22,7 @@ _REGIME_MULTIPLIERS = {
     Regime.SETTLED: 0.0,
 }
 
-_SKEW_EDGE_PREMIUM = 0.005   # additional half-spread when accepting skew
+_SKEW_EDGE_PREMIUM = 0.01  # must survive cent-level rounding; 0.005 rounds away
 
 
 @dataclass
@@ -86,6 +86,10 @@ class QuoteEngine:
         # Clamp to valid range and round to cent
         bid_price = max(0.01, round(bid_price, 2))
         ask_price = min(0.99, round(ask_price, 2))
+
+        # Guard: ensure spread is positive after rounding
+        if bid_price >= ask_price:
+            bid_price = max(0.01, ask_price - 0.02)
 
         # Size logic by regime
         if inp.regime == Regime.ONE_SIDE_FILLED:

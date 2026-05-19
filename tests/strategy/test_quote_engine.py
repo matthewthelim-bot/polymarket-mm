@@ -102,7 +102,8 @@ def test_skew_widens_bid_when_accepted():
     engine = make_engine()
     d_no_skew = engine.compute(make_input(hedgeability=make_result(hedgeable=100, unhedgeable=0, skew_accepted=0)))
     d_with_skew = engine.compute(make_input(hedgeability=make_result(hedgeable=50, unhedgeable=50, skew_accepted=50)))
-    assert d_with_skew.bid_price <= d_no_skew.bid_price
+    # With 0.01 skew premium and cent-level rounding, the bid must be strictly lower
+    assert d_with_skew.bid_price < d_no_skew.bid_price
 
 
 # --- Size constraints ---
