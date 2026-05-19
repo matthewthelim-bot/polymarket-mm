@@ -46,6 +46,7 @@ class SimulatorConfig:
     resolution_time: Optional[datetime] = None  # if set, compute time_to_resolution dynamically
     adverse_selection_window_seconds: float = 300.0   # seconds to wait before measuring AS
     adverse_selection_adverse_threshold: float = 0.005  # minimum price drop to count as adverse
+    quote_staleness_threshold: float = 0.0  # 0 = disabled; e.g. 0.01 = skip if FV moved >1 cent
 
 
 @dataclass
@@ -66,6 +67,7 @@ class SimulationResult:
     # Adverse selection metrics
     as_events_measured: int = 0         # fills that completed their AS measurement window
     as_rate: float = 0.0                # fraction of measured fills that were adverse (all-time)
+    num_stale_quote_skips: int = 0          # fill checks skipped due to stale FV
 
     def total_pnl(self) -> float:
         return self.total_spread_pnl + self.total_skew_pnl
@@ -126,6 +128,7 @@ class BacktestSimulator:
             window_seconds=config.adverse_selection_window_seconds,
             adverse_threshold=config.adverse_selection_adverse_threshold,
         )
+        self._last_fv: float | None = None     # FV at last fill-check (for staleness)
 
     def run(self, events: list[Event]) -> SimulationResult:
         self._result = SimulationResult()
@@ -136,6 +139,7 @@ class BacktestSimulator:
             window_seconds=self.config.adverse_selection_window_seconds,
             adverse_threshold=self.config.adverse_selection_adverse_threshold,
         )
+        self._last_fv = None
         for event in events:
             if isinstance(event, OrderBook):
                 self._on_book(event)
@@ -198,6 +202,19 @@ class BacktestSimulator:
     def _check_fill(self, trade: Fill, fv: float) -> None:
         """Check whether a market trade fills our resting bid (pre-FV-update state)."""
         decision = self._compute_quote(fv, trade.timestamp)
+
+        # Staleness check: if FV has jumped more than threshold since last fill-check,
+        # our resting quote would have been pulled before this trade arrived.
+        if (
+            self.config.quote_staleness_threshold > 0.0
+            and self._last_fv is not None
+            and abs(fv - self._last_fv) > self.config.quote_staleness_threshold
+        ):
+            self._result.num_stale_quote_skips += 1
+            self._last_fv = fv
+            return
+        self._last_fv = fv
+
         # Track quoting opportunity accessibility: count how often the quote engine
         # produced a non-zero bid (hedge available OR skew accepted).
         self._result.hedge_checks_total += 1

@@ -296,3 +296,115 @@ class TestASTrackerWiring:
         )
         # as_rate must be valid [0, 1]
         assert 0.0 <= result.as_rate <= 1.0
+
+
+class TestQuoteStaleness:
+    """When FV jumps between consecutive trades, stale quotes should be skipped."""
+
+    def test_result_has_staleness_field(self):
+        """SimulationResult has num_stale_quote_skips field defaulting to 0."""
+        result = SimulationResult()
+        assert hasattr(result, "num_stale_quote_skips")
+        assert result.num_stale_quote_skips == 0
+
+    def test_threshold_zero_disabled(self):
+        """With threshold=0 (disabled), stale skip counter stays 0."""
+        sim = make_simulator()  # default threshold=0
+        result = sim.run([])
+        assert result.num_stale_quote_skips == 0
+
+    def test_staleness_skips_fill_on_fv_jump(self):
+        """
+        When FV jumps more than threshold between two trades, the second
+        fill check is skipped and num_stale_quote_skips increments.
+        """
+        from datetime import datetime, timezone, timedelta
+        from src.data.schemas import OrderBook, PriceLevel, Fill, Side
+
+        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        fee_rate = 0.04
+        fv1 = 0.48
+        fv2 = 0.52  # jump of 0.04, above threshold of 0.02
+
+        expected_bid_1 = round(fv1 - max(0.015, fee_rate * fv1 * (1 - fv1) + 0.005), 2)
+        expected_bid_2 = round(fv2 - max(0.015, fee_rate * fv2 * (1 - fv2) + 0.005), 2)
+        no_ask = round(1.0 - fv1 + 0.001, 2)
+
+        fm = FeeModel()
+        meta = make_metadata()
+        no_skew = SkewConfig(
+            skew_tolerance=0.0, skew_edge_premium=0.005,
+            skew_hard_limit=0, skew_capital_charge_multiplier=3.0,
+            max_skew_notional=0.0, current_skew_notional=0.0,
+        )
+        sim = BacktestSimulator(
+            metadata=meta,
+            fee_model=fm,
+            fv_estimator=FairValueEstimator(twap_window_seconds=300),
+            regime_classifier=RegimeClassifier(),
+            hedgeability_assessor=HedgeabilityAssessor(fm, fee_rate, 0.20, 0.005),
+            quote_engine=QuoteEngine(fm, fee_rate, 0.20),
+            inventory_manager=InventoryManager("test-001"),
+            pnl_engine=PnLEngine(fm, fee_rate, 0.20),
+            fill_model=FillModel(FillModelConfig()),
+            skew_config=no_skew,
+            config=SimulatorConfig(
+                time_to_resolution_hours=48.0,
+                quote_staleness_threshold=0.02,  # skip if FV moves >2 cents
+            ),
+        )
+
+        book = OrderBook(
+            market_id="test-001",
+            timestamp=base,
+            bids=[PriceLevel(expected_bid_1, 500.0)],
+            asks=[PriceLevel(no_ask, 500.0)],
+        )
+
+        # First warmup trade at fv1 — sets FV to 0.48, _last_fv = 0.48
+        warmup1 = Fill(
+            fill_id="w1", market_id="test-001", side=Side.BUY,
+            price=fv1, size=200.0,
+            timestamp=base + timedelta(seconds=1), is_maker=False,
+        )
+
+        # Second warmup trade at fv1 again — triggers fill check with FV=0.48
+        # _last_fv becomes 0.48 after this check
+        warmup2 = Fill(
+            fill_id="w2", market_id="test-001", side=Side.BUY,
+            price=fv1, size=200.0,
+            timestamp=base + timedelta(seconds=2), is_maker=False,
+        )
+
+        # Big jump trade at fv2 — FV TWAP shifts toward 0.52
+        # After warmup1+warmup2+this: FV ~= (0.48*200 + 0.48*200 + 0.52*200) / 600 = 0.493...
+        # Actually TWAP with 300s window: all 3 warmup trades in window
+        # fv = (0.48*200 + 0.48*200 + 0.52*200) / 600 = 0.4933
+        # delta from _last_fv (0.48) = 0.0133... < 0.02 threshold — not stale yet
+        # We need a bigger jump. Use fv2=0.60 instead.
+        #
+        # Actually let's use a simpler approach: use large size for the jump trade
+        # so TWAP shifts significantly. With fv2=0.60 and size=2000 vs 200+200:
+        # fv = (0.48*400 + 0.60*2000) / 2400 = (192 + 1200)/2400 = 0.5800
+        # delta = 0.58 - 0.48 = 0.10 > 0.02 threshold -> skip!
+        jump_trade = Fill(
+            fill_id="j1", market_id="test-001", side=Side.BUY,
+            price=0.60, size=2000.0,  # big buy pushes TWAP up substantially
+            timestamp=base + timedelta(seconds=3), is_maker=False,
+        )
+
+        # Fill trigger at what would be the new bid — should be SKIPPED due to staleness
+        fill_trigger = Fill(
+            fill_id="t1", market_id="test-001", side=Side.BUY,
+            price=expected_bid_2, size=1000.0,
+            timestamp=base + timedelta(seconds=4), is_maker=False,
+        )
+
+        events = [book, warmup1, warmup2, jump_trade, fill_trigger]
+        result = sim.run(events)
+
+        # The fill_trigger check should have been skipped due to FV jump
+        assert result.num_stale_quote_skips >= 1, (
+            f"Expected at least 1 stale skip but got {result.num_stale_quote_skips}. "
+            f"FV jumped but staleness check did not fire."
+        )
