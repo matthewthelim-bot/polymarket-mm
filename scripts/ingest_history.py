@@ -9,25 +9,65 @@ Endpoints used:
   GET https://gamma-api.polymarket.com/markets?conditionId={condition_id}
   GET https://clob.polymarket.com/trades?market={token_id}&limit=500
 
+Authentication:
+  Set these environment variables (or use a .env file with python-dotenv):
+    POLY_ADDRESS      — your wallet address (0x...)
+    POLY_API_KEY      — from derive_key.py
+    POLY_API_SECRET   — from derive_key.py
+    POLY_API_PASSPHRASE — from derive_key.py
+
 Note: Polymarket does not provide full historical order book snapshots via public API.
 The ingestion stores trade events. For higher-fidelity backtesting, use the WebSocket
 feed captured in real-time.
 """
 
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import os
-import tempfile
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
 
-API_KEY = os.environ.get("POLYMARKET_API_KEY", "")
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv optional; set env vars manually if not installed
 
-CLOB_BASE = "https://clob.polymarket.com"
+POLY_ADDRESS     = os.environ.get("POLY_ADDRESS", "")
+POLY_API_KEY     = os.environ.get("POLY_API_KEY", "")
+POLY_API_SECRET  = os.environ.get("POLY_API_SECRET", "")
+POLY_PASSPHRASE  = os.environ.get("POLY_API_PASSPHRASE", "")
+
+CLOB_BASE  = "https://clob.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
+
+
+def _l2_headers(method: str, path: str, body: str = "") -> dict:
+    """Build Polymarket L2 HMAC auth headers for authenticated CLOB requests."""
+    timestamp = str(int(time.time()))
+    # Signature message: timestamp + METHOD + /path + body
+    message = timestamp + method.upper() + path + body.replace("'", '"')
+    secret_bytes = base64.b64decode(POLY_API_SECRET)
+    sig = base64.b64encode(
+        hmac.new(secret_bytes, message.encode(), hashlib.sha256).digest()
+    ).decode()
+    return {
+        "POLY_ADDRESS":    POLY_ADDRESS,
+        "POLY_API_KEY":    POLY_API_KEY,
+        "POLY_PASSPHRASE": POLY_PASSPHRASE,
+        "POLY_TIMESTAMP":  timestamp,
+        "POLY_SIGNATURE":  sig,
+    }
+
+
+def _has_credentials() -> bool:
+    return all([POLY_ADDRESS, POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE])
 
 
 def fetch_market_info(condition_id: str) -> dict:
@@ -51,6 +91,13 @@ def fetch_trades(token_id: str, days: int, out_path: Path) -> int:
     cursor = None
     total = 0
 
+    if not _has_credentials():
+        raise PermissionError(
+            "Missing Polymarket credentials. Set these environment variables:\n"
+            "  POLY_ADDRESS, POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE\n"
+            "Run derive_key.py to get them, then add to your .env file."
+        )
+
     tmp_path = out_path.with_suffix(".jsonl.tmp")
     try:
         with tmp_path.open("w") as f:
@@ -58,15 +105,17 @@ def fetch_trades(token_id: str, days: int, out_path: Path) -> int:
                 params = {"market": token_id, "limit": 500}
                 if cursor:
                     params["next_cursor"] = cursor
-                headers = {}
-                if API_KEY:
-                    headers["Authorization"] = f"Bearer {API_KEY}"
+
+                # Build path with query string for signature
+                query = "&".join(f"{k}={v}" for k, v in params.items())
+                path = f"/trades?{query}"
+                headers = _l2_headers("GET", path)
+
                 r = requests.get(f"{CLOB_BASE}/trades", params=params, headers=headers, timeout=15)
                 if r.status_code == 401:
                     raise PermissionError(
-                        "CLOB /trades requires authentication. "
-                        "Set POLYMARKET_API_KEY environment variable. "
-                        "See: https://docs.polymarket.com/developers/clob/api-keys"
+                        "Authentication failed (401). Check your credentials in .env:\n"
+                        "  POLY_ADDRESS, POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE"
                     )
                 r.raise_for_status()
                 data = r.json()
