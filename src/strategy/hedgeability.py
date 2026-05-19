@@ -22,6 +22,7 @@ class SkewConfig:
     skew_capital_charge_multiplier: float  # 3.0x capital charge vs hedgeable
     max_skew_notional: float           # USDC notional cap on skew bucket
     current_skew_notional: float       # current skew notional already held
+    current_skew_contracts: float = 0.0  # current cumulative skew contracts (for hard limit)
 
 
 @dataclass
@@ -62,13 +63,18 @@ class HedgeabilityAssessor:
         book: OrderBook,
         own_order_ids: set[str],
         skew_config: SkewConfig,
-        own_order_sizes: dict[str, float] | None = None,
+        own_order_sizes: dict[float, float] | None = None,  # key: price level, value: own size at that price
     ) -> HedgeabilityResult:
         """
         Assess hedgeability of a passive fill at quote_price for quote_size contracts.
 
         quote_side=BUY  → we bought Yes; hedge by buying No (check ask side)
         quote_side=SELL → we sold Yes; hedge by selling No (check bid side)
+
+        own_order_ids: kept for caller compatibility; available for future use.
+        own_order_sizes: dict keyed by price level (float) → own size at that price.
+            Only the size at each specific level is stripped, preventing over-stripping
+            across a multi-level book.
         """
         p_max = self.fee_model.max_flatten_price(
             p_fill=quote_price,
@@ -106,11 +112,16 @@ class HedgeabilityAssessor:
         self,
         book: OrderBook,
         own_order_ids: set[str],
-        own_order_sizes: dict[str, float],
+        own_order_sizes: dict[float, float],  # keyed by price level
         max_price: float,
         side: Side,
     ) -> float:
-        """Sum opposing-side depth at prices <= max_price, stripping own orders."""
+        """Sum opposing-side depth at prices <= max_price, stripping own orders.
+
+        own_order_sizes is keyed by price (rounded to 6 dp) so only the own-order
+        size at each specific price level is subtracted — not the total own-order
+        size from every level in the book.
+        """
         # For a BUY fill, we look at asks (we'll taker-buy the opposing side)
         levels = book.asks if side == Side.BUY else book.bids
         total = 0.0
@@ -119,9 +130,7 @@ class HedgeabilityAssessor:
                 break  # asks sorted ascending; stop when too expensive
             if side == Side.SELL and level.price < max_price:
                 break  # bids sorted descending; stop when too cheap
-            own_at_level = sum(
-                own_order_sizes.get(oid, 0.0) for oid in own_order_ids
-            )
+            own_at_level = (own_order_sizes or {}).get(round(level.price, 6), 0.0)
             net = max(0.0, level.size - own_at_level)
             total += net
         return total
@@ -143,9 +152,13 @@ class HedgeabilityAssessor:
         if notional_room <= 0:
             return 0.0, unhedgeable_size
 
+        # Hard limit (contract count circuit breaker)
+        contracts_room = skew_config.skew_hard_limit - skew_config.current_skew_contracts
+
         max_by_notional = notional_room / quote_price if quote_price > 0 else 0.0
         max_by_tolerance = skew_config.skew_tolerance
-        max_acceptable = min(max_by_notional, max_by_tolerance)
+        max_by_hard_limit = max(0.0, contracts_room)
+        max_acceptable = min(max_by_notional, max_by_tolerance, max_by_hard_limit)
 
         accepted = min(unhedgeable_size, max_acceptable)
         rejected = unhedgeable_size - accepted

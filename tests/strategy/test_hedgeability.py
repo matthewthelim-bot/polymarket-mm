@@ -110,10 +110,30 @@ def test_own_orders_stripped_from_depth():
         book=book,
         own_order_ids={"ord-1"},
         skew_config=NO_SKEW,
-        own_order_sizes={"ord-1": 150.0},
+        own_order_sizes={0.50: 150.0},  # 150 of our own at price 0.50
     )
     # Net depth = 200 - 150 = 50
     assert result.hedgeable_size == pytest.approx(50.0)
+    assert result.unhedgeable_size == pytest.approx(50.0)
+
+
+def test_own_orders_only_strip_at_correct_level():
+    assessor = make_assessor()
+    # Two ask levels: 0.50 (200), 0.52 (100). Own order of 150 at 0.50.
+    # max_flatten_price at 0.46 ≈ 0.527, so both levels are below ceiling.
+    # Net depth: (200-150) + 100 = 150
+    book = make_book(asks=[(0.50, 200.0), (0.52, 100.0)])
+    result = assessor.assess(
+        quote_side=Side.BUY,
+        quote_price=0.46,
+        quote_size=200.0,
+        book=book,
+        own_order_ids={"ord-1"},
+        skew_config=NO_SKEW,
+        own_order_sizes={0.50: 150.0},  # only at 0.50, not at 0.52
+    )
+    # Net depth = (200-150) + 100 = 150; min(200, 150) = 150 hedgeable
+    assert result.hedgeable_size == pytest.approx(150.0)
     assert result.unhedgeable_size == pytest.approx(50.0)
 
 
@@ -151,7 +171,7 @@ def test_skew_accepted_within_tolerance():
     assert result.skew_rejected == pytest.approx(0.0)
 
 
-def test_skew_hard_limit_enforced():
+def test_skew_hard_limit_notional_still_enforced():
     assessor = make_assessor()
     book = make_book(asks=[])
     config = SkewConfig(
@@ -160,7 +180,7 @@ def test_skew_hard_limit_enforced():
         skew_hard_limit=200,
         skew_capital_charge_multiplier=3.0,
         max_skew_notional=500.0,
-        current_skew_notional=180.0,  # already near limit
+        current_skew_notional=180.0,  # already near notional limit
     )
     result = assessor.assess(
         quote_side=Side.BUY,
@@ -174,3 +194,28 @@ def test_skew_hard_limit_enforced():
     # at price 0.46, max new skew contracts = 320/0.46 ≈ 695
     # but quote_size=100, so all 100 accepted (notional room is sufficient)
     assert result.skew_accepted * 0.46 + 180.0 <= 500.0 + 1e-6
+
+
+def test_skew_hard_limit_blocks_when_contracts_at_limit():
+    assessor = make_assessor()
+    book = make_book(asks=[])
+    config = SkewConfig(
+        skew_tolerance=100.0,
+        skew_edge_premium=0.005,
+        skew_hard_limit=200,
+        skew_capital_charge_multiplier=3.0,
+        max_skew_notional=500.0,
+        current_skew_notional=0.0,
+        current_skew_contracts=200.0,  # already AT the hard limit
+    )
+    result = assessor.assess(
+        quote_side=Side.BUY,
+        quote_price=0.46,
+        quote_size=100.0,
+        book=book,
+        own_order_ids=set(),
+        skew_config=config,
+    )
+    # Hard limit hit — no new skew accepted
+    assert result.skew_accepted == pytest.approx(0.0)
+    assert result.skew_rejected == pytest.approx(100.0)
