@@ -24,6 +24,8 @@ from pathlib import Path
 
 import requests
 
+API_KEY = os.environ.get("POLYMARKET_API_KEY", "")
+
 CLOB_BASE = "https://clob.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
@@ -35,6 +37,11 @@ def fetch_market_info(condition_id: str) -> dict:
     data = r.json()
     if not data:
         raise ValueError(f"No market found for conditionId={condition_id}")
+    # Filter to find the exact market (API may return a group)
+    needle = condition_id.lower()
+    for m in data:
+        if m.get("conditionId", "").lower() == needle:
+            return m
     return data[0]
 
 
@@ -51,7 +58,16 @@ def fetch_trades(token_id: str, days: int, out_path: Path) -> int:
                 params = {"market": token_id, "limit": 500}
                 if cursor:
                     params["next_cursor"] = cursor
-                r = requests.get(f"{CLOB_BASE}/trades", params=params, timeout=15)
+                headers = {}
+                if API_KEY:
+                    headers["Authorization"] = f"Bearer {API_KEY}"
+                r = requests.get(f"{CLOB_BASE}/trades", params=params, headers=headers, timeout=15)
+                if r.status_code == 401:
+                    raise PermissionError(
+                        "CLOB /trades requires authentication. "
+                        "Set POLYMARKET_API_KEY environment variable. "
+                        "See: https://docs.polymarket.com/developers/clob/api-keys"
+                    )
                 r.raise_for_status()
                 data = r.json()
 
@@ -72,7 +88,7 @@ def fetch_trades(token_id: str, days: int, out_path: Path) -> int:
                         "side": trade.get("side", "buy").lower(),
                         "price": float(trade.get("price", 0)),
                         "size": float(trade.get("size", 0)),
-                        "is_maker": False,  # public API trades; maker/taker undetermined from our perspective
+                        "is_maker": bool(trade.get("maker_address") is not None),
                     }
                     f.write(json.dumps(event) + "\n")
                     total += 1
@@ -101,14 +117,19 @@ def main():
 
     print(f"Fetching market info for {args.market}...")
     info = fetch_market_info(args.market)
-    token_id = info.get("clob_token_ids", [None])[0]
+    raw_tokens = info.get("clobTokenIds") or info.get("clob_token_ids")
+    if not raw_tokens:
+        raise ValueError(f"No token ID found for {args.market}")
+    if isinstance(raw_tokens, str):
+        raw_tokens = json.loads(raw_tokens)
+    token_id = raw_tokens[0]
     if not token_id:
         raise ValueError(f"No token ID found for {args.market}")
 
     print(f"Token ID: {token_id}")
     out_path = out_dir / f"{token_id}.jsonl"
 
-    print(f"Downloading {args.days} days of trades → {out_path}")
+    print(f"Downloading {args.days} days of trades -> {out_path}")
     n = fetch_trades(token_id, args.days, out_path)
     print(f"Done. {n} trade events written to {out_path}")
 
