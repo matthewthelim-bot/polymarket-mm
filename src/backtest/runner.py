@@ -10,6 +10,8 @@ Usage:
 
 from __future__ import annotations
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
 
 from src.fee_model import FeeModel
 from src.data.schemas import MarketMetadata
@@ -52,6 +54,7 @@ class RunConfig:
     skew_hard_limit: int = 0
     skew_capital_charge_multiplier: float = 3.0
     max_skew_notional: float = 0.0
+    resolution_time: Optional[datetime] = None  # if set, compute time_to_resolution dynamically
 
 
 class BacktestRunner:
@@ -153,6 +156,7 @@ class BacktestRunner:
                 pre_resolution_hours=cfg.pre_resolution_hours,
                 warehouse_threshold_fraction=cfg.warehouse_threshold_fraction,
                 daily_capital_charge_rate=cfg.daily_capital_charge_rate,
+                resolution_time=cfg.resolution_time,
             ),
         )
 

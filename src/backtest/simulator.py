@@ -13,7 +13,8 @@ No separate fee approximations.
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Union
+from datetime import datetime
+from typing import Optional, Union
 
 from src.fee_model import FeeModel
 from src.data.schemas import (
@@ -41,6 +42,7 @@ class SimulatorConfig:
     pre_resolution_hours: float = 4.0
     warehouse_threshold_fraction: float = 0.80
     daily_capital_charge_rate: float = 0.0003
+    resolution_time: Optional[datetime] = None  # if set, compute time_to_resolution dynamically
 
 
 @dataclass
@@ -52,6 +54,7 @@ class SimulationResult:
     num_fills: int = 0
     num_book_updates: int = 0
     num_cycles_completed: int = 0
+    num_open_positions: int = 0
 
     def total_pnl(self) -> float:
         return self.total_spread_pnl + self.total_skew_pnl
@@ -107,6 +110,12 @@ class BacktestSimulator:
                 self._on_book(event)
             elif isinstance(event, Fill):
                 self._on_trade(event)
+
+        # Record unrealized open position
+        if self._pending_entry is not None:
+            self._result.num_open_positions = 1  # pending but unclosed
+            # Don't call compute_settlement — resolution price unknown in backtest
+
         return self._result
 
     # ------------------------------------------------------------------
@@ -198,12 +207,17 @@ class BacktestSimulator:
     def _compute_quote(self, fv: float, timestamp) -> object | None:
         """Compute QuoteDecision for the current state."""
         inv_state = self.inventory_manager.state()
+        if self.config.resolution_time is not None:
+            delta = self.config.resolution_time - timestamp
+            time_to_res = max(0.0, delta.total_seconds() / 3600.0)
+        else:
+            time_to_res = self.config.time_to_resolution_hours
         regime_inp = RegimeInput(
             timestamp=timestamp,
             inventory=inv_state,
             adverse_selection=self._as_estimate,
             adverse_selection_threshold=self.config.adverse_selection_threshold,
-            time_to_resolution_hours=self.config.time_to_resolution_hours,
+            time_to_resolution_hours=time_to_res,
             pre_resolution_hours=self.config.pre_resolution_hours,
             max_inventory_contracts=self.config.max_inventory_contracts,
             warehouse_threshold_fraction=self.config.warehouse_threshold_fraction,
