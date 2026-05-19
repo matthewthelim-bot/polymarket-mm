@@ -122,10 +122,19 @@ def test_H2_loss_when_flatten_above_breakeven(tmp_path):
     ]
     write_events(tmp_path / f"{market}.jsonl", events)
     result = BacktestRunner(make_run_config(str(tmp_path), market)).run()
-    # The hedgeability check sets bid_size=0 when no opposing depth is within max_flatten_price.
-    # So no cycle completes and PnL stays at 0 (inventory held, not flattened at a loss).
-    assert result.total_spread_pnl <= 0, (
-        f"H2 FAIL: Simulator should not flatten at a loss. PnL={result.total_spread_pnl:.4f}"
+    # With asks at 0.62 (above max_flatten_price ≈ 0.507), the hedgeability
+    # gate returns hedgeable_size=0, causing QuoteEngine to set bid_size=0.
+    # No fill should occur and no cycle should complete.
+    assert result.num_fills == 0, (
+        f"H2 FAIL: Hedgeability gate should suppress bid when only asks at 0.62. "
+        f"Fills={result.num_fills}"
+    )
+    assert result.num_cycles_completed == 0, (
+        f"H2 FAIL: No cycle should complete when bid is suppressed. "
+        f"Cycles={result.num_cycles_completed}"
+    )
+    assert result.total_spread_pnl == pytest.approx(0.0), (
+        f"H2 FAIL: PnL should be zero with no fills. PnL={result.total_spread_pnl:.4f}"
     )
 
 
@@ -228,7 +237,9 @@ def test_H6_backtest_fees_match_direct_calculation(tmp_path):
         make_run_config(str(tmp_path), market, fee_rate=fee_rate, rebate_fraction=rebate_fraction)
     ).run()
 
-    if result.num_cycles_completed > 0:
-        assert result.total_fees_paid == pytest.approx(expected_fee, rel=0.05), (
-            f"H6 FAIL: Backtest fee {result.total_fees_paid:.6f} != direct calc {expected_fee:.6f}"
-        )
+    assert result.num_cycles_completed > 0, (
+        "H6 FAIL: No cycle completed — backtest must complete a cycle for fee verification"
+    )
+    assert result.total_fees_paid == pytest.approx(expected_fee, rel=1e-6), (
+        f"H6 FAIL: Backtest fee {result.total_fees_paid:.8f} != direct calc {expected_fee:.8f}"
+    )
