@@ -1,0 +1,13 @@
+markets:
+  - condition_id: "test-crypto-001"
+    category: crypto
+    fee_rate: 0.07
+    fee_exponent: 1
+  - condition_id: "test-politics-001"
+    category: politics
+    fee_rate: 0.04
+    fee_exponent: 1
+  - condition_id: "test-sports-001"
+    category: sports
+    fee_rate: 0.03
+    fee_exponent: 1

@@ -1,0 +1,23 @@
+strategy:
+  min_edge_floor: 0.005
+  half_spread_base: 0.015
+  max_inventory_contracts: 500
+  adverse_selection_window: 15
+  adverse_selection_threshold: 0.012
+  capital_charge_rate: 0.0003
+  skew_capital_charge_multiplier: 3.0
+
+skew:
+  skew_tolerance: 0.0
+  skew_edge_premium: 0.005
+  skew_hard_limit: 100
+  max_skew_notional: 500.0
+
+fee:
+  rebate_fraction: 0.20
+
+backtest:
+  queue_model: FRONT
+  fill_model: TOUCH
+  latency_ms: 50
+  start_capital: 50000.0
