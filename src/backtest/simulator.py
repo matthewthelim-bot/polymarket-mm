@@ -172,16 +172,11 @@ class BacktestSimulator:
         # Record the fill
         self._result.num_fills += 1
 
-        maker_rebate = self.fee_model.maker_rebate(
-            fill_result.filled_size,
-            decision.bid_price,
-            self.meta.fee_rate,
-            self.meta.rebate_fraction,
-        )
-        self._result.total_rebates_received += maker_rebate
-
         # Determine skew classification
         hedge_result = self._assess_hedgeability(decision.bid_price, fill_result.filled_size)
+        # Simplification: classify entire fill as skew only when no hedge is available.
+        # Partial hedges (hedgeable_size > 0 but < fill_size) are attributed to spread.
+        # Full two-bucket split is a future improvement.
         is_skew = hedge_result.hedgeable_size == 0 and hedge_result.skew_accepted > 0
 
         sim_fill = Fill(
@@ -218,7 +213,10 @@ class BacktestSimulator:
         )
         regime = self.regime_classifier.classify(regime_inp)
 
-        hedge_result = self._assess_hedgeability(fv - 0.015, self.config.quote_size)
+        # Provisional bid price for hedgeability check.
+        # Uses half_spread_base as approximation; actual bid may differ by regime/fee adjustment.
+        provisional_bid = fv - self.quote_engine.half_spread_base
+        hedge_result = self._assess_hedgeability(provisional_bid, self.config.quote_size)
 
         quote_inp = QuoteInput(
             fv=fv,
@@ -274,6 +272,8 @@ class BacktestSimulator:
             return  # not yet profitable
 
         flatten_size = min(entry.size, book.asks[0].size)
+        if flatten_size <= 0:
+            return
         self._record_flatten(entry, flatten_price, flatten_size)
 
     def _attempt_flatten_via_trade(self, trade: Fill) -> None:
@@ -298,17 +298,14 @@ class BacktestSimulator:
             return
 
         flatten_size = min(entry.size, self._current_book.asks[0].size)
+        if flatten_size <= 0:
+            return
         self._record_flatten(entry, flatten_price, flatten_size)
 
     def _record_flatten(
         self, entry: Fill, flatten_price: float, flatten_size: float
     ) -> None:
         """Record a flatten, compute PnL, update inventory."""
-        fee = self.fee_model.taker_fee(
-            flatten_size, flatten_price, self.meta.fee_rate
-        )
-        self._result.total_fees_paid += fee
-
         cycle = CompletedCycle(
             market_id=self.meta.condition_id,
             entry_price=entry.price,
@@ -320,6 +317,8 @@ class BacktestSimulator:
         cycle_result = self.pnl_engine.compute_cycle(cycle)
         self._result.total_spread_pnl += cycle_result.spread_pnl
         self._result.total_skew_pnl += cycle_result.skew_pnl
+        self._result.total_fees_paid += cycle_result.taker_fee_paid
+        self._result.total_rebates_received += cycle_result.maker_rebate_received
         self._result.num_cycles_completed += 1
 
         self.inventory_manager.add_flatten(flatten_size, flatten_price)
