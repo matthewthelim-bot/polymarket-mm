@@ -40,6 +40,7 @@ def load_market_configs(
     half_spread_base: float,
     time_to_resolution_hours: float,
     adverse_selection_window_seconds: float,
+    adverse_selection_adverse_threshold: float,
     quote_staleness_threshold: float,
 ) -> list[RunConfig]:
     configs = []
@@ -63,6 +64,7 @@ def load_market_configs(
             half_spread_base=half_spread_base,
             time_to_resolution_hours=time_to_resolution_hours,
             adverse_selection_window_seconds=adverse_selection_window_seconds,
+            adverse_selection_adverse_threshold=adverse_selection_adverse_threshold,
             quote_staleness_threshold=quote_staleness_threshold,
         )
         configs.append(cfg)
@@ -125,6 +127,8 @@ def main():
                         help="Hours to resolution (default 2160 = 90 days)")
     parser.add_argument("--as-window", type=float, default=300.0,
                         help="Adverse selection measurement window (seconds)")
+    parser.add_argument("--as-threshold", type=float, default=0.005,
+                        help="Adverse selection classification threshold (default 0.005 = 0.5 cents)")
     parser.add_argument("--staleness-threshold", type=float, default=0.0,
                         help="Quote staleness threshold (0 = disabled; e.g. 0.01)")
     args = parser.parse_args()
@@ -140,6 +144,7 @@ def main():
         half_spread_base=args.half_spread,
         time_to_resolution_hours=args.time_to_resolution,
         adverse_selection_window_seconds=args.as_window,
+        adverse_selection_adverse_threshold=args.as_threshold,
         quote_staleness_threshold=args.staleness_threshold,
     )
 

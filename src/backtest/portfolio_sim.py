@@ -12,6 +12,7 @@ Capital at risk per trade = fill_price * quote_size (e.g. 0.50 * 100 = $50).
 """
 
 from __future__ import annotations
+import sys
 from dataclasses import dataclass, field
 
 from src.backtest.runner import BacktestRunner, RunConfig
@@ -57,7 +58,11 @@ class PortfolioSimulator:
             return result
 
         for cfg in self.run_configs:
-            mkt_result = BacktestRunner(cfg).run()
+            try:
+                mkt_result = BacktestRunner(cfg).run()
+            except (FileNotFoundError, OSError) as exc:
+                print(f"WARNING: skipping {cfg.market_id}: {exc}", file=sys.stderr)
+                continue
             result.market_results[cfg.market_id] = mkt_result
             result.total_pnl += mkt_result.total_pnl()
             result.total_fills += mkt_result.num_fills

@@ -205,6 +205,9 @@ class BacktestSimulator:
 
         # Staleness check: if FV has jumped more than threshold since last fill-check,
         # our resting quote would have been pulled before this trade arrived.
+        # _last_fv is reset to the current fv after a stale skip, so only the
+        # first trade after a large FV jump is skipped — subsequent trades are
+        # evaluated fresh against the updated baseline.
         if (
             self.config.quote_staleness_threshold > 0.0
             and self._last_fv is not None
