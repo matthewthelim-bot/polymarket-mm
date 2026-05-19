@@ -54,6 +54,13 @@ def test_pro_rata_fill_proportion():
     assert result.filled_size == pytest.approx(10.0)
 
 
+def test_pro_rata_zero_book_returns_no_fill():
+    model = FillModel(FillModelConfig(queue_model=QueueModel.PRO_RATA))
+    inp = make_input(quote_price=0.46, market_trade_price=0.46, book_size_at_price=0.0)
+    result = model.simulate_fill(inp)
+    assert result.filled_size == pytest.approx(0.0)
+
+
 # --- BACK model ---
 
 def test_back_fills_only_if_full_book_cleared():
@@ -83,6 +90,20 @@ def test_back_fills_when_book_cleared():
     assert result.filled_size == pytest.approx(100.0)
 
 
+def test_back_exact_book_exhaustion_fills():
+    """trade_size exactly equals book_size → we are filled (>= boundary)."""
+    model = FillModel(FillModelConfig(queue_model=QueueModel.BACK))
+    inp = make_input(
+        quote_price=0.46,
+        market_trade_price=0.46,
+        market_trade_size=500.0,  # exactly equals book_size
+        book_size_at_price=500.0,
+        quote_size=100.0,
+    )
+    result = model.simulate_fill(inp)
+    assert result.filled_size == pytest.approx(100.0)
+
+
 # --- Latency ---
 
 def test_latency_delays_fill():
@@ -90,3 +111,15 @@ def test_latency_delays_fill():
     inp = make_input()
     result = model.simulate_fill(inp)
     assert result.latency_ms == 100
+
+
+# --- Input validation ---
+
+def test_negative_quote_size_raises():
+    with pytest.raises(ValueError, match="quote_size"):
+        make_input(quote_size=-10.0)
+
+
+def test_negative_trade_size_raises():
+    with pytest.raises(ValueError, match="market_trade_size"):
+        make_input(market_trade_size=-5.0)
