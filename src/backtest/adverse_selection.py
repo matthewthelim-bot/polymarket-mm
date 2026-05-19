@@ -11,7 +11,7 @@ price units (e.g. 0.02 = 2 cents), directly comparable to
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -80,16 +80,18 @@ class AdverseSelectionTracker:
         return sum(ev.fill_price - ev.observed_price for ev in adverse) / len(adverse)
 
     def stats(self) -> dict:
-        """Summary statistics for reporting."""
-        recent = self._completed[-self.rolling_n:]
-        adverse = [ev for ev in recent if ev.is_adverse]
+        """Summary statistics for reporting. All counts are all-time totals."""
+        all_adverse = [ev for ev in self._completed if ev.is_adverse]
+        num_measured = len(self._completed)
+        num_adverse = len(all_adverse)
+        as_rate = num_adverse / num_measured if num_measured > 0 else 0.0
         avg_mag = (
-            sum(ev.fill_price - ev.observed_price for ev in adverse) / len(adverse)
-            if adverse else 0.0
+            sum(ev.fill_price - ev.observed_price for ev in all_adverse) / len(all_adverse)
+            if all_adverse else 0.0
         )
         return {
-            "num_measured": len(self._completed),
-            "num_adverse": len([ev for ev in self._completed if ev.is_adverse]),
-            "as_rate": len(adverse) / len(recent) if recent else 0.0,
+            "num_measured": num_measured,
+            "num_adverse": num_adverse,
+            "as_rate": as_rate,
             "avg_magnitude": avg_mag,
         }
