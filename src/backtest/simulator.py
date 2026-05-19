@@ -198,7 +198,8 @@ class BacktestSimulator:
     def _check_fill(self, trade: Fill, fv: float) -> None:
         """Check whether a market trade fills our resting bid (pre-FV-update state)."""
         decision = self._compute_quote(fv, trade.timestamp)
-        # Track hedge accessibility: count how often the book had hedgeable depth
+        # Track quoting opportunity accessibility: count how often the quote engine
+        # produced a non-zero bid (hedge available OR skew accepted).
         self._result.hedge_checks_total += 1
         if decision is not None and not decision.suspend and decision.bid_size > 0:
             self._result.hedge_accessible_count += 1
