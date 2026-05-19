@@ -16,6 +16,8 @@ feed captured in real-time.
 
 import argparse
 import json
+import os
+import tempfile
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -42,42 +44,48 @@ def fetch_trades(token_id: str, days: int, out_path: Path) -> int:
     cursor = None
     total = 0
 
-    with out_path.open("w") as f:
-        while True:
-            params = {"market": token_id, "limit": 500}
-            if cursor:
-                params["next_cursor"] = cursor
-            r = requests.get(f"{CLOB_BASE}/trades", params=params, timeout=15)
-            r.raise_for_status()
-            data = r.json()
+    tmp_path = out_path.with_suffix(".jsonl.tmp")
+    try:
+        with tmp_path.open("w") as f:
+            while True:
+                params = {"market": token_id, "limit": 500}
+                if cursor:
+                    params["next_cursor"] = cursor
+                r = requests.get(f"{CLOB_BASE}/trades", params=params, timeout=15)
+                r.raise_for_status()
+                data = r.json()
 
-            trades = data.get("data", [])
-            next_cursor = data.get("next_cursor")
+                trades = data.get("data", [])
+                next_cursor = data.get("next_cursor")
 
-            stop_early = False
-            for trade in trades:
-                trade_ts = int(trade.get("timestamp", 0))
-                if trade_ts < since_ts:
-                    stop_early = True
+                stop_early = False
+                for trade in trades:
+                    trade_ts = int(trade.get("timestamp", 0))
+                    if trade_ts < since_ts:
+                        stop_early = True
+                        break
+                    event = {
+                        "event_type": "trade",
+                        "market_id": token_id,
+                        "fill_id": trade.get("id", ""),
+                        "timestamp": datetime.fromtimestamp(trade_ts, tz=timezone.utc).isoformat(),
+                        "side": trade.get("side", "buy").lower(),
+                        "price": float(trade.get("price", 0)),
+                        "size": float(trade.get("size", 0)),
+                        "is_maker": False,  # public API trades; maker/taker undetermined from our perspective
+                    }
+                    f.write(json.dumps(event) + "\n")
+                    total += 1
+
+                if stop_early or not next_cursor or not trades:
                     break
-                event = {
-                    "event_type": "trade",
-                    "market_id": token_id,
-                    "fill_id": trade.get("id", ""),
-                    "timestamp": datetime.fromtimestamp(trade_ts, tz=timezone.utc).isoformat(),
-                    "side": trade.get("side", "buy").lower(),
-                    "price": float(trade.get("price", 0)),
-                    "size": float(trade.get("size", 0)),
-                    "is_maker": trade.get("maker_order_id") is not None,
-                }
-                f.write(json.dumps(event) + "\n")
-                total += 1
+                cursor = next_cursor
+                time.sleep(0.2)
 
-            if stop_early or not next_cursor or not trades:
-                break
-            cursor = next_cursor
-            time.sleep(0.2)
-
+        tmp_path.replace(out_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
     return total
 
 

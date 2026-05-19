@@ -10,17 +10,20 @@ Yields OrderBook and Fill objects sorted by timestamp.
 
 from __future__ import annotations
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Union
+
+logger = logging.getLogger(__name__)
 
 from src.data.schemas import OrderBook, PriceLevel, Fill, Side
 
 
 @dataclass
 class LoaderConfig:
-    data_dir: str   # directory where market JSONL files are stored
+    data_dir: Union[str, Path]   # directory where market JSONL files are stored
 
 
 Event = Union[OrderBook, Fill]
@@ -42,7 +45,7 @@ class HistoricalDataLoader:
 
         events: list[Event] = []
         with path.open() as f:
-            for line in f:
+            for line_num, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
                     continue
@@ -51,7 +54,8 @@ class HistoricalDataLoader:
                     event = self._parse_event(raw)
                     if event is not None:
                         events.append(event)
-                except (json.JSONDecodeError, KeyError, ValueError):
+                except (json.JSONDecodeError, KeyError, ValueError) as e:
+                    logger.warning("Skipping malformed event on line %d: %s", line_num, e)
                     continue
 
         events.sort(key=lambda e: e.timestamp)
