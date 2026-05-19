@@ -110,3 +110,14 @@ def test_capital_charge_combined():
     charge = mgr.daily_capital_charge(skew_multiplier=3.0)
     expected = (100 * 0.46 * 0.0003) + (50 * 0.46 * 0.0003 * 3.0)
     assert charge == pytest.approx(expected)
+
+
+def test_avg_fill_price_stable_after_partial_flatten():
+    # avg_fill_price should be unchanged after a partial flatten.
+    # We bought 100 @ 0.46. Flatten 50 (half). Avg price stays 0.46.
+    mgr = InventoryManager(market_id="m1")
+    mgr.add_fill(make_fill(0.46, 100.0), is_skew=False)
+    mgr.add_flatten(size=50.0, price=0.52)
+    state = mgr.state()
+    assert state.hedgeable_contracts == pytest.approx(50.0)
+    assert state.avg_fill_price == pytest.approx(0.46)
