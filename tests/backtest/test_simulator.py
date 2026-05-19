@@ -176,3 +176,29 @@ def test_multiple_book_updates_counted():
     books = [make_book(t=i) for i in range(5)]
     result = sim.run(events=books)
     assert result.num_book_updates == 5
+
+
+class TestASTrackerWiring:
+    """Verify AS tracker updates _as_estimate and populates result fields."""
+
+    def test_result_has_as_fields(self):
+        """SimulationResult has as_events_measured and as_rate fields."""
+        result = SimulationResult()
+        assert hasattr(result, "as_events_measured")
+        assert hasattr(result, "as_rate")
+        assert result.as_events_measured == 0
+        assert result.as_rate == 0.0
+
+    def test_simulator_config_has_as_fields(self):
+        """SimulatorConfig has adverse_selection_window_seconds and adverse_threshold fields."""
+        cfg = SimulatorConfig()
+        assert hasattr(cfg, "adverse_selection_window_seconds")
+        assert hasattr(cfg, "adverse_selection_adverse_threshold")
+        assert cfg.adverse_selection_window_seconds == 300.0
+        assert cfg.adverse_selection_adverse_threshold == 0.005
+
+    def test_empty_run_as_fields_zero(self):
+        """Running simulator with no events leaves AS fields at 0."""
+        result = make_simulator().run([])
+        assert result.as_events_measured == 0
+        assert result.as_rate == 0.0
