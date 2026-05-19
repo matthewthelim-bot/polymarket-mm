@@ -1,0 +1,89 @@
+"""
+HistoricalDataLoader — reads line-delimited JSON files produced by scripts/ingest_history.py.
+
+Each line is one event:
+  {"event_type": "book", "market_id": ..., "timestamp": ..., "bids": [...], "asks": [...]}
+  {"event_type": "trade", "market_id": ..., "fill_id": ..., "timestamp": ..., ...}
+
+Yields OrderBook and Fill objects sorted by timestamp.
+"""
+
+from __future__ import annotations
+import json
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterator, Union
+
+from src.data.schemas import OrderBook, PriceLevel, Fill, Side
+
+
+@dataclass
+class LoaderConfig:
+    data_dir: str   # directory where market JSONL files are stored
+
+
+Event = Union[OrderBook, Fill]
+
+
+class HistoricalDataLoader:
+
+    def __init__(self, config: LoaderConfig):
+        self.data_dir = Path(config.data_dir)
+
+    def load_market(self, market_id: str) -> Iterator[Event]:
+        """
+        Load all events for a market, sorted by timestamp.
+        Raises FileNotFoundError if the market file doesn't exist.
+        """
+        path = self.data_dir / f"{market_id}.jsonl"
+        if not path.exists():
+            raise FileNotFoundError(f"No data file for market {market_id}: {path}")
+
+        events: list[Event] = []
+        with path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw = json.loads(line)
+                    event = self._parse_event(raw)
+                    if event is not None:
+                        events.append(event)
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    continue
+
+        events.sort(key=lambda e: e.timestamp)
+        yield from events
+
+    def _parse_event(self, raw: dict) -> Event | None:
+        event_type = raw.get("event_type")
+        if event_type == "book":
+            return self._parse_book(raw)
+        elif event_type == "trade":
+            return self._parse_fill(raw)
+        return None
+
+    def _parse_book(self, raw: dict) -> OrderBook:
+        return OrderBook(
+            market_id=raw["market_id"],
+            timestamp=self._parse_ts(raw["timestamp"]),
+            bids=[PriceLevel(b["price"], b["size"]) for b in raw.get("bids", [])],
+            asks=[PriceLevel(a["price"], a["size"]) for a in raw.get("asks", [])],
+        )
+
+    def _parse_fill(self, raw: dict) -> Fill:
+        return Fill(
+            fill_id=raw.get("fill_id", ""),
+            market_id=raw["market_id"],
+            side=Side.BUY if raw["side"].lower() == "buy" else Side.SELL,
+            price=float(raw["price"]),
+            size=float(raw["size"]),
+            timestamp=self._parse_ts(raw["timestamp"]),
+            is_maker=bool(raw.get("is_maker", False)),
+        )
+
+    @staticmethod
+    def _parse_ts(ts_str: str) -> datetime:
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
