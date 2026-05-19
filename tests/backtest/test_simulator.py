@@ -207,12 +207,27 @@ class TestASTrackerWiring:
         """
         After a fill is recorded and trades arrive past the AS window,
         the simulator should have measured at least one AS event.
+
+        Design: pre-compute the expected bid price, put it in the book,
+        and use it as the fill trigger price — this guarantees a fill fires.
         """
         base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
 
-        # Use a 30-second AS window so our test events trigger measurement
+        # Parameters matching make_metadata(): fee_rate=0.04, rebate=0.20
+        fee_rate = 0.04
+        fv_price = 0.48  # warmup trade price -> FV = 0.48
+
+        # Compute expected bid (same formula as QuoteEngine):
+        # fee_cost = fee_rate * fv * (1-fv) = 0.04 * 0.48 * 0.52 = 0.009984
+        # half_spread = max(0.015, 0.009984 + 0.005) = max(0.015, 0.014984) = 0.015
+        # bid = round(0.48 - 0.015, 2) = 0.46 (Python banker's rounds 0.465 -> 0.46)
         fm = FeeModel()
-        meta = make_metadata()  # fee_rate=0.04, rebate=0.20
+        fee_cost = fm.fee_flatten_expected(fv=fv_price, fee_rate=fee_rate)
+        half_spread = max(0.015, fee_cost + 0.005)
+        expected_bid = round(fv_price - half_spread, 2)
+        no_ask = round(1.0 - fv_price + 0.001, 2)  # ~0.521; within hedgeability ceiling
+
+        meta = make_metadata()
         no_skew = SkewConfig(
             skew_tolerance=0.0, skew_edge_premium=0.005,
             skew_hard_limit=0, skew_capital_charge_multiplier=3.0,
@@ -223,48 +238,46 @@ class TestASTrackerWiring:
             fee_model=fm,
             fv_estimator=FairValueEstimator(twap_window_seconds=300),
             regime_classifier=RegimeClassifier(),
-            hedgeability_assessor=HedgeabilityAssessor(fm, 0.04, 0.20, 0.005),
-            quote_engine=QuoteEngine(fm, 0.04, 0.20),
+            hedgeability_assessor=HedgeabilityAssessor(fm, fee_rate, 0.20, 0.005),
+            quote_engine=QuoteEngine(fm, fee_rate, 0.20),
             inventory_manager=InventoryManager("test-001"),
-            pnl_engine=PnLEngine(fm, 0.04, 0.20),
+            pnl_engine=PnLEngine(fm, fee_rate, 0.20),
             fill_model=FillModel(FillModelConfig()),
             skew_config=no_skew,
             config=SimulatorConfig(
                 time_to_resolution_hours=48.0,
-                adverse_selection_window_seconds=30.0,   # short window for test
+                adverse_selection_window_seconds=30.0,   # short window so test trades close it
                 adverse_selection_adverse_threshold=0.005,
             ),
         )
 
-        # Book: bids at 0.45, asks at 0.55
+        # Order book: bid exactly at our computed bid price so book_size_at_bid > 0
         book = OrderBook(
             market_id="test-001",
             timestamp=base,
-            bids=[PriceLevel(0.45, 500.0)],
-            asks=[PriceLevel(0.55, 500.0)],
+            bids=[PriceLevel(expected_bid, 500.0)],
+            asks=[PriceLevel(no_ask, 500.0)],
         )
 
-        # Warmup trade to seed FV estimator (so FV is not None)
+        # Warmup: BUY trade at fv_price seeds the FV estimator
         warmup = Fill(
             fill_id="w1", market_id="test-001", side=Side.BUY,
-            price=0.48, size=200.0,
+            price=fv_price, size=200.0,
             timestamp=base + timedelta(seconds=1), is_maker=False,
         )
 
-        # Fill trigger: a sell trade at our bid price.
-        # With FV ~0.48 and fee_rate=0.04, bid ~= 0.48 - max(0.015, 0.04*0.48*0.52 + 0.005)
-        # = 0.48 - max(0.015, 0.00998 + 0.005) = 0.48 - 0.015 = 0.465
-        # Round to 0.46 after .round(2). Use price=0.46 for the sell trigger.
+        # Fill trigger: SELL trade at exactly expected_bid with large size.
+        # The fill model sees: market_trade_price == quote_price -> fills.
         fill_trigger = Fill(
             fill_id="t1", market_id="test-001", side=Side.SELL,
-            price=0.46, size=1000.0,  # large sell at our bid — triggers fill
+            price=expected_bid, size=1000.0,
             timestamp=base + timedelta(seconds=2), is_maker=False,
         )
 
-        # Post-fill trade arriving AFTER the 30s window, at a LOWER price (adverse)
+        # Post-fill trade arriving after the 30s window, at a lower price (adverse)
         post_fill_adverse = Fill(
             fill_id="t2", market_id="test-001", side=Side.SELL,
-            price=0.40,  # dropped 6 cents — adverse
+            price=expected_bid - 0.06,  # dropped 6 cents — adverse
             size=100.0,
             timestamp=base + timedelta(seconds=35), is_maker=False,
         )
@@ -272,12 +285,14 @@ class TestASTrackerWiring:
         events = [book, warmup, fill_trigger, post_fill_adverse]
         result = sim.run(events)
 
-        # We may or may not have gotten a fill (depends on exact bid computation)
-        # but if we did get a fill, it should be measured by the post-fill trade
-        if result.num_fills > 0:
-            assert result.as_events_measured >= 1, (
-                "Expected at least one AS measurement after fill + post-window trade"
-            )
-        # Whether or not there was a fill, the result should always have the fields
-        assert result.as_events_measured >= 0
+        # Fill must have fired — the setup guarantees it
+        assert result.num_fills > 0, (
+            f"Expected fill at bid {expected_bid} but got 0 fills. "
+            f"Check FV warmup and bid computation."
+        )
+        # AS measurement must have run — fill + post-window trade were provided
+        assert result.as_events_measured >= 1, (
+            "Expected at least one AS measurement after fill + post-window trade"
+        )
+        # as_rate must be valid [0, 1]
         assert 0.0 <= result.as_rate <= 1.0
