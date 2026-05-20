@@ -34,7 +34,10 @@ import logging
 import signal
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+
+import requests as _requests
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -43,6 +46,10 @@ from src.live.credentials import load_credentials, CredentialError
 from src.live.clob_client import ClobClient
 from src.live.book_feed import BookFeed
 from src.live.quote_loop import QuoteLoop, QuoteLoopConfig
+from src.strategy.fair_value import TradeObservation
+
+
+DATA_API = "https://data-api.polymarket.com"
 
 
 def setup_logging(verbose: bool) -> None:
@@ -159,6 +166,60 @@ def build_quote_loop(
     return QuoteLoop(config=config, clob_client=client, fee_model=fee_model)
 
 
+def seed_fv_from_recent_trades(
+    loop: QuoteLoop,
+    condition_id: str,
+    yes_token_id: str,
+    n_trades: int = 50,
+) -> int:
+    """
+    Fetch recent trades from the Data API and seed the QuoteLoop's FV estimator.
+
+    Returns the number of trades seeded.
+    """
+    log = logging.getLogger("run_live")
+    try:
+        resp = _requests.get(
+            f"{DATA_API}/trades",
+            params={"market": condition_id, "limit": n_trades, "takerOnly": "false"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        trades = resp.json()
+    except Exception as exc:
+        log.warning("FV seed failed for %s: %s", loop.config.market_id[:40], exc)
+        return 0
+
+    count = 0
+    # Trades come newest-first; feed oldest-first for TWAP to be correct
+    yes_trades = [
+        t for t in trades
+        if str(t.get("asset", t.get("token_id", ""))) == str(yes_token_id)
+    ]
+    for trade in reversed(yes_trades):
+        try:
+            ts = datetime.fromtimestamp(
+                float(trade.get("timestamp", 0)), tz=timezone.utc
+            )
+            obs = TradeObservation(
+                price=float(trade.get("price", 0)),
+                size=float(trade.get("size", 0)),
+                timestamp=ts,
+            )
+            loop._fv_estimator.on_trade(obs)
+            count += 1
+        except Exception:
+            pass
+
+    if count:
+        fv = loop._fv_estimator.estimate(as_of=datetime.now(timezone.utc))
+        log.info(
+            "  FV seeded: %d trades, current FV=%.3f (%s)",
+            count, fv or 0.0, loop.config.market_id[:50],
+        )
+    return count
+
+
 def print_startup_banner(loops: list[QuoteLoop], dry_run: bool) -> None:
     log = logging.getLogger("run_live")
     mode = "DRY-RUN (no orders will be placed)" if dry_run else "*** LIVE TRADING ***"
@@ -240,6 +301,16 @@ async def main_async(args: argparse.Namespace) -> None:
     if not loops:
         log.error("No markets could be resolved. Exiting.")
         sys.exit(1)
+
+    # Seed fair-value estimators with recent trade history so quotes start immediately
+    log.info("Seeding fair-value estimators from recent trades...")
+    for loop in loops:
+        seed_fv_from_recent_trades(
+            loop,
+            condition_id=loop.config.condition_id,
+            yes_token_id=loop.config.yes_token_id,
+        )
+        time.sleep(0.15)  # rate limit
 
     print_startup_banner(loops, dry_run=not args.live)
 

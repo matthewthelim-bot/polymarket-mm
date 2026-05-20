@@ -124,7 +124,9 @@ class QuoteLoop:
         self._fm = fee_model or FeeModel()
 
         # Strategy components
-        self._fv_estimator = FairValueEstimator(twap_window_seconds=300, external_weight=0.0)
+        # Use a 4-hour TWAP window for live trading — prediction markets trade slowly
+        # and we need enough history to have a stable fair value estimate.
+        self._fv_estimator = FairValueEstimator(twap_window_seconds=14400, external_weight=0.0)
         self._regime_classifier = RegimeClassifier()
         self._hedgeability_assessor = HedgeabilityAssessor(
             self._fm, config.fee_rate, config.rebate_fraction, config.min_edge_floor
