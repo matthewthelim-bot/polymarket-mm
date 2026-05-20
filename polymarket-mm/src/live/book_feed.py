@@ -46,7 +46,7 @@ from src.data.schemas import OrderBook, PriceLevel
 
 logger = logging.getLogger(__name__)
 
-WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/"
+WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 BookCallback = Callable[[str, OrderBook], None]   # (token_id, book) -> None
 
@@ -193,11 +193,12 @@ class BookFeed:
             ping_interval=self._config.ping_interval_seconds,
             ping_timeout=self._config.ping_timeout_seconds,
         ) as ws:
-            # Subscribe to book channel for all tokens
+            # Subscribe to market book channel for all tokens
+            # Polymarket WS /ws/market subscription format:
+            # {"assets_ids": [...], "type": "Market"}
             sub_msg = json.dumps({
-                "type": "subscribe",
-                "channel": "book",
                 "assets_ids": self._token_ids,
+                "type": "Market",
             })
             await ws.send(sub_msg)
             logger.info(

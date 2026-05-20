@@ -18,15 +18,13 @@ SECURITY: Never log credential values or Authorization headers.
 """
 
 from __future__ import annotations
-import hashlib
-import hmac
 import json
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 import requests
-from datetime import datetime, timezone
 
 from src.data.schemas import OrderBook, PriceLevel, Side
 from src.live.credentials import Credentials
@@ -81,7 +79,13 @@ class Position:
 
 class ClobClient:
     """
-    Thin HTTP client for the Polymarket CLOB and Gamma APIs.
+    HTTP client for the Polymarket CLOB and Gamma APIs.
+
+    Public endpoints (no auth): get_book, get_condition_id_for_token, get_market_tokens,
+    get_market_token_ids.
+
+    Authenticated endpoints: place_order, cancel_order, get_open_orders, get_positions.
+    These delegate to py-clob-client for correct EIP-712 order signing and L2 HMAC auth.
 
     Args:
         credentials: Loaded from src.live.credentials.load_credentials().
@@ -99,6 +103,38 @@ class ClobClient:
         self._session = requests.Session()
         self._session.headers["Accept"] = "application/json"
         self._session.headers["Content-Type"] = "application/json"
+        self._py_client = None  # lazy-initialized when auth is needed
+
+    def _get_py_client(self):
+        """
+        Lazy-initialize the py-clob-client ClobClient for authenticated operations.
+        Requires py-clob-client to be installed.
+        """
+        if self._py_client is not None:
+            return self._py_client
+        self._require_auth()
+        try:
+            from py_clob_client.client import ClobClient as _PyClobClient
+            from py_clob_client.clob_types import ApiCreds
+            from py_clob_client.constants import POLYGON
+        except ImportError:
+            raise RuntimeError(
+                "py-clob-client is required for authenticated operations. "
+                "Install it: pip install py-clob-client"
+            )
+        api_creds = ApiCreds(
+            api_key=self._creds.poly_api_key,
+            api_secret=self._creds.poly_api_secret,
+            api_passphrase=self._creds.poly_api_passphrase,
+        )
+        self._py_client = _PyClobClient(
+            host=CLOB_BASE,
+            chain_id=POLYGON,
+            key=self._creds.private_key,
+            creds=api_creds,
+            signature_type=1,   # L2 auth
+        )
+        return self._py_client
 
     # ------------------------------------------------------------------
     # Public (no auth)
@@ -278,29 +314,44 @@ class ClobClient:
         """
         Place a limit order on the CLOB.
 
-        Requires credentials.
+        Requires credentials. Uses py-clob-client for correct EIP-712 signing.
 
         Args:
-            order: OrderRequest with token_id, side, price, size.
+            order: OrderRequest with token_id, side, price, size, time_in_force.
 
         Returns:
             OrderResponse with order_id and fill status.
         """
-        self._require_auth()
-        payload = {
-            "token_id": order.token_id,
-            "side": order.side.value if hasattr(order.side, "value") else str(order.side),
-            "price": str(round(order.price, 4)),
-            "size": str(round(order.size, 2)),
-            "time_in_force": order.time_in_force,
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        py_client = self._get_py_client()
+
+        side_str = order.side.value if hasattr(order.side, "value") else str(order.side)
+
+        # Map time_in_force to OrderType
+        order_type_map = {
+            "GTC": OrderType.GTC,
+            "GTD": OrderType.GTD,
+            "FOK": OrderType.FOK,
+            "FAK": OrderType.FAK,
         }
-        resp = self._authed_post("/order", payload)
-        data = resp.json()
+        order_type = order_type_map.get(order.time_in_force.upper(), OrderType.GTC)
+
+        order_args = OrderArgs(
+            token_id=order.token_id,
+            price=order.price,
+            size=order.size,
+            side=side_str,
+        )
+        resp = py_client.create_and_post_order(order_args)
+
+        if resp is None:
+            raise RuntimeError("Order placement returned None from py-clob-client")
+
         return OrderResponse(
-            order_id=data.get("order_id", ""),
-            status=data.get("status", "unknown"),
-            filled_size=float(data.get("size_matched", 0)),
-            remaining_size=float(data.get("size_remaining", order.size)),
+            order_id=resp.get("orderID", resp.get("order_id", "")),
+            status=resp.get("status", "unknown"),
+            filled_size=float(resp.get("size_matched", 0)),
+            remaining_size=float(resp.get("size_remaining", order.size)),
         )
 
     def cancel_order(self, order_id: str) -> bool:
@@ -313,9 +364,9 @@ class ClobClient:
         Returns:
             True if the cancellation was accepted.
         """
-        self._require_auth()
-        resp = self._authed_delete(f"/order/{order_id}")
-        return resp.status_code in (200, 204)
+        py_client = self._get_py_client()
+        resp = py_client.cancel(order_id=order_id)
+        return resp is not None
 
     def get_open_orders(self, market_id: Optional[str] = None) -> list[OpenOrder]:
         """
@@ -327,13 +378,13 @@ class ClobClient:
         Returns:
             List of OpenOrder objects.
         """
-        self._require_auth()
+        py_client = self._get_py_client()
         params = {}
         if market_id:
             params["market"] = market_id
-        resp = self._authed_get("/orders", params=params)
-        data = resp.json()
-        orders = data if isinstance(data, list) else data.get("data", [])
+        # py-clob-client get_orders returns raw list
+        raw = py_client.get_orders()
+        orders = raw if isinstance(raw, list) else []
         return [
             OpenOrder(
                 order_id=o.get("id", ""),
@@ -348,25 +399,28 @@ class ClobClient:
 
     def get_positions(self) -> list[Position]:
         """
-        Fetch current open positions.
+        Fetch current open positions via CLOB balance-allowance endpoint.
 
         Returns:
-            List of Position objects (token_id → net size).
+            List of Position objects (token_id -> net size).
         """
-        self._require_auth()
-        resp = self._authed_get("/positions")
-        data = resp.json()
-        positions = data if isinstance(data, list) else data.get("data", [])
+        py_client = self._get_py_client()
+        resp = py_client.get_balance_allowance()
+        if resp is None:
+            return []
+        # Response is a dict; positions may be inside 'assets'
+        assets = resp if isinstance(resp, list) else resp.get("assets", [])
         return [
             Position(
-                token_id=p.get("asset", p.get("token_id", "")),
-                size=float(p.get("size", p.get("quantity", 0))),
+                token_id=p.get("asset_id", p.get("token_id", "")),
+                size=float(p.get("balance", p.get("size", 0))),
             )
-            for p in positions
+            for p in assets
+            if float(p.get("balance", p.get("size", 0))) > 0
         ]
 
     # ------------------------------------------------------------------
-    # Auth helpers (L2 HMAC)
+    # Auth helper
     # ------------------------------------------------------------------
 
     def _require_auth(self) -> None:
@@ -375,60 +429,3 @@ class ClobClient:
                 "Authenticated endpoint called without credentials. "
                 "Pass credentials to ClobClient()."
             )
-
-    def _auth_headers(self, method: str, path: str, body: str = "") -> dict[str, str]:
-        """
-        Build L2 HMAC authentication headers.
-
-        Header format:
-            POLY-API-KEY: <api_key>
-            POLY-TIMESTAMP: <unix_ms>
-            POLY-SIGNATURE: HMAC-SHA256(secret, timestamp + method + path + body)
-            POLY-PASSPHRASE: <passphrase>
-        """
-        ts = str(int(time.time() * 1000))
-        message = ts + method.upper() + path + body
-        sig = hmac.new(
-            self._creds.poly_api_secret.encode(),
-            message.encode(),
-            hashlib.sha256,
-        ).hexdigest()  # type: ignore[attr-defined]
-        return {
-            "POLY-API-KEY": self._creds.poly_api_key,
-            "POLY-TIMESTAMP": ts,
-            "POLY-SIGNATURE": sig,
-            "POLY-PASSPHRASE": self._creds.poly_api_passphrase,
-        }
-
-    def _authed_get(self, path: str, params: Optional[dict] = None) -> requests.Response:
-        headers = self._auth_headers("GET", path)
-        resp = self._session.get(
-            f"{CLOB_BASE}{path}",
-            headers=headers,
-            params=params,
-            timeout=self._timeout,
-        )
-        resp.raise_for_status()
-        return resp
-
-    def _authed_post(self, path: str, payload: dict) -> requests.Response:
-        body = json.dumps(payload)
-        headers = self._auth_headers("POST", path, body)
-        resp = self._session.post(
-            f"{CLOB_BASE}{path}",
-            headers=headers,
-            data=body,
-            timeout=self._timeout,
-        )
-        resp.raise_for_status()
-        return resp
-
-    def _authed_delete(self, path: str) -> requests.Response:
-        headers = self._auth_headers("DELETE", path)
-        resp = self._session.delete(
-            f"{CLOB_BASE}{path}",
-            headers=headers,
-            timeout=self._timeout,
-        )
-        resp.raise_for_status()
-        return resp
