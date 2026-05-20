@@ -2,17 +2,21 @@
 """
 Download historical trade data from Polymarket and save as JSONL.
 
-Usage — pass anything from the browser URL bar:
+For each trade we also emit a synthetic order-book snapshot so the
+backtest simulator has a live book to work with (the public API does
+not provide historical L2 snapshots).
+
+Usage — paste any Polymarket URL:
     py scripts/ingest_history.py --market "polymarket.com/sports/epl/epl-bou-mac-2026-05-19"
     py scripts/ingest_history.py --market "epl-bou-mac-2026-05-19"
     py scripts/ingest_history.py --market "0xabc123..."
 
-The script auto-detects whether you passed a URL, slug, or condition ID
-and resolves everything automatically — no manual ID lookup needed.
-
 Optional flags:
-    --out data/raw      output directory (default: data/raw)
-    --days 30           days of history to download (default: 30)
+    --out data/raw          output directory (default: data/raw)
+    --days 30               days of history counting back from today (default: 30)
+    --since 2024-09-01      explicit start date (overrides --days)
+    --spread 0.02           synthetic book half-spread in price units (default: 0.02)
+    --book-size 500         synthetic book depth in contracts per level (default: 500)
 """
 
 import argparse
@@ -44,17 +48,15 @@ def resolve_market(market_input: str) -> tuple[str, str, str]:
     """
     raw = market_input.strip().rstrip("/")
 
-    # Already a condition ID
     if re.match(r"^0x[0-9a-fA-F]{10,}$", raw):
         return _resolve_by_condition_id(raw)
 
-    # URL or slug — take the last path segment
     slug = raw.split("/")[-1].split("?")[0]
     return _resolve_by_slug(slug)
 
 
 def _resolve_by_slug(slug: str) -> tuple[str, str, str]:
-    # Try events endpoint first (sports events have multiple sub-markets)
+    # Sports events have multiple sub-markets — try events endpoint first
     r = requests.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=10)
     r.raise_for_status()
     events = r.json()
@@ -70,7 +72,6 @@ def _resolve_by_slug(slug: str) -> tuple[str, str, str]:
             if condition_id:
                 return condition_id, token_id, title
 
-    # Fall back to markets endpoint
     r = requests.get(f"{GAMMA_BASE}/markets", params={"slug": slug}, timeout=10)
     r.raise_for_status()
     markets = r.json()
@@ -116,12 +117,49 @@ def _extract_token_id(market: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Trade fetching (public endpoint — no auth required)
+# Synthetic order-book builder
 # ---------------------------------------------------------------------------
 
-def fetch_trades(condition_id: str, token_id: str, days: int, out_path: Path) -> int:
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-    since_ts = int(since.timestamp())
+def make_book_event(
+    market_id: str,
+    timestamp_iso: str,
+    yes_trade_price: float,
+    spread: float,
+    book_size: float,
+) -> dict:
+    """
+    Construct a synthetic NO-side order-book event from a YES-token trade.
+
+    The backtest simulator uses the book to:
+      - Assess whether the NO-side is hedgeable (hedgeability assessor)
+      - Find a flatten price when we hold YES inventory
+
+    NO price = 1 - YES price.  We place one level on each side of the NO mid.
+    """
+    no_mid = 1.0 - yes_trade_price
+    no_bid = round(max(0.01, no_mid - spread / 2), 4)
+    no_ask = round(min(0.99, no_mid + spread / 2), 4)
+    return {
+        "event_type": "book",
+        "market_id": market_id,
+        "timestamp": timestamp_iso,
+        "bids": [{"price": no_bid, "size": book_size}],
+        "asks": [{"price": no_ask, "size": book_size}],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Trade fetching
+# ---------------------------------------------------------------------------
+
+def fetch_trades(
+    condition_id: str,
+    token_id: str,
+    since_ts: int,
+    out_path: Path,
+    spread: float,
+    book_size: float,
+) -> int:
     offset = 0
     limit = 500
     total = 0
@@ -150,15 +188,23 @@ def fetch_trades(condition_id: str, token_id: str, days: int, out_path: Path) ->
                         stop_early = True
                         break
 
+                    yes_price = float(trade.get("price", 0))
+                    timestamp_iso = datetime.fromtimestamp(
+                        trade_ts, tz=timezone.utc
+                    ).isoformat()
+
+                    # Synthetic book snapshot — emitted just before the trade
+                    book = make_book_event(token_id, timestamp_iso, yes_price, spread, book_size)
+                    f.write(json.dumps(book) + "\n")
+
+                    # Trade event
                     event = {
                         "event_type": "trade",
                         "market_id": token_id,
                         "fill_id": trade.get("transactionHash", f"tx_{total}"),
-                        "timestamp": datetime.fromtimestamp(
-                            trade_ts, tz=timezone.utc
-                        ).isoformat(),
+                        "timestamp": timestamp_iso,
                         "side": trade.get("side", "BUY").upper(),
-                        "price": float(trade.get("price", 0)),
+                        "price": yes_price,
                         "size": float(trade.get("size", 0)),
                         "is_maker": False,
                     }
@@ -187,16 +233,26 @@ def main():
     parser = argparse.ArgumentParser(
         description="Ingest Polymarket trade history",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Pass any Polymarket URL, slug, or condition ID to --market.",
+        epilog=__doc__,
     )
     parser.add_argument(
         "--market", required=True,
-        help='Polymarket URL, slug, or condition ID  '
-             '(e.g. "polymarket.com/sports/epl/epl-bou-mac-2026-05-19")',
+        help="Polymarket URL, slug, or condition ID",
     )
     parser.add_argument("--out", default="data/raw", help="Output directory (default: data/raw)")
-    parser.add_argument("--days", type=int, default=30, help="Days of history (default: 30)")
+    parser.add_argument("--days", type=int, default=30, help="Days of history counting back from today (default: 30)")
+    parser.add_argument("--since", default=None, help="Explicit start date YYYY-MM-DD (overrides --days)")
+    parser.add_argument("--spread", type=float, default=0.02,
+                        help="Synthetic book half-spread in price units (default: 0.02)")
+    parser.add_argument("--book-size", type=float, default=500,
+                        help="Synthetic book depth in contracts per level (default: 500)")
     args = parser.parse_args()
+
+    if args.since:
+        since_dt = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    else:
+        since_dt = datetime.now(timezone.utc) - timedelta(days=args.days)
+    since_ts = int(since_dt.timestamp())
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -207,12 +263,13 @@ def main():
     print(f"  Market:       {title}")
     print(f"  Condition ID: {condition_id}")
     print(f"  Token ID:     {token_id}")
+    print(f"  Since:        {since_dt.strftime('%Y-%m-%d')}")
 
     out_path = out_dir / f"{token_id}.jsonl"
-    print(f"\nDownloading {args.days} days of trades -> {out_path}")
+    print(f"\nDownloading trades -> {out_path}")
 
-    n = fetch_trades(condition_id, token_id, args.days, out_path)
-    print(f"Done. {n} trade events written to {out_path}")
+    n = fetch_trades(condition_id, token_id, since_ts, out_path, args.spread, args.book_size)
+    print(f"Done. {n} trades written (+ {n} synthetic book snapshots) to {out_path}")
 
 
 if __name__ == "__main__":
