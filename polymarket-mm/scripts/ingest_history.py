@@ -197,6 +197,11 @@ def fetch_trades(
                         stop_early = True
                         break
 
+                    # Skip NO-token trades — condition ID returns both YES and NO trades.
+                    # Filter to YES token only using the `asset` field.
+                    if str(trade.get("asset", "")) != str(token_id):
+                        continue
+
                     yes_price = float(trade.get("price", 0))
                     timestamp_iso = datetime.fromtimestamp(
                         trade_ts, tz=timezone.utc
