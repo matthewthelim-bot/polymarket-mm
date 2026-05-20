@@ -42,6 +42,8 @@ def load_market_configs(
     adverse_selection_window_seconds: float,
     adverse_selection_adverse_threshold: float,
     quote_staleness_threshold: float,
+    skew_tolerance: float,
+    skew_edge_premium: float,
 ) -> list[RunConfig]:
     configs = []
     for jsonl_path in sorted(data_dir.glob("*.jsonl")):
@@ -52,6 +54,11 @@ def load_market_configs(
                 params = json.load(f)
         else:
             params = DEFAULT_FEE_PARAMS.copy()
+
+        # When skew_tolerance > 0, set permissive circuit-breaker limits so
+        # skew_tolerance is the sole throttle in backtesting.
+        skew_hard_limit = int(skew_tolerance * 10) if skew_tolerance > 0 else 0
+        max_skew_notional = skew_tolerance * 2.0 if skew_tolerance > 0 else 0.0
 
         cfg = RunConfig(
             market_id=market_id,
@@ -66,6 +73,10 @@ def load_market_configs(
             adverse_selection_window_seconds=adverse_selection_window_seconds,
             adverse_selection_adverse_threshold=adverse_selection_adverse_threshold,
             quote_staleness_threshold=quote_staleness_threshold,
+            skew_tolerance=skew_tolerance,
+            skew_edge_premium=skew_edge_premium,
+            skew_hard_limit=skew_hard_limit,
+            max_skew_notional=max_skew_notional,
         )
         configs.append(cfg)
     return configs
@@ -131,6 +142,10 @@ def main():
                         help="Adverse selection classification threshold (default 0.005 = 0.5 cents)")
     parser.add_argument("--staleness-threshold", type=float, default=0.0,
                         help="Quote staleness threshold (0 = disabled; e.g. 0.01)")
+    parser.add_argument("--skew-tolerance", type=float, default=0.0,
+                        help="Max unhedgeable contracts to accept as skew inventory (0 = disabled)")
+    parser.add_argument("--skew-edge-premium", type=float, default=0.005,
+                        help="Extra edge required on skew quotes above min_edge_floor (default 0.005)")
     args = parser.parse_args()
 
     data_dir = Path(args.data)
@@ -146,6 +161,8 @@ def main():
         adverse_selection_window_seconds=args.as_window,
         adverse_selection_adverse_threshold=args.as_threshold,
         quote_staleness_threshold=args.staleness_threshold,
+        skew_tolerance=args.skew_tolerance,
+        skew_edge_premium=args.skew_edge_premium,
     )
 
     if not configs:

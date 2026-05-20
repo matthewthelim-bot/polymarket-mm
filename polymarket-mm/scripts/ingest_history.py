@@ -106,7 +106,12 @@ def _resolve_by_condition_id(condition_id: str) -> tuple[str, str, str]:
     if not data:
         raise ValueError(f"No market found for conditionId={condition_id}")
     needle = condition_id.lower()
-    m = next((x for x in data if x.get("conditionId", "").lower() == needle), data[0])
+    m = next((x for x in data if x.get("conditionId", "").lower() == needle), None)
+    if m is None:
+        raise ValueError(
+            f"conditionId={condition_id} not found in Gamma API response. "
+            f"Try passing the market slug instead."
+        )
     return condition_id, _extract_token_id(m), m.get("question", condition_id)
 
 
