@@ -76,10 +76,16 @@ def _resolve_by_slug(slug: str) -> tuple[str, str, str]:
     r.raise_for_status()
     markets = r.json()
 
+    # Retry with closed=true for resolved markets
+    if not markets:
+        r = requests.get(f"{GAMMA_BASE}/markets", params={"slug": slug, "closed": "true"}, timeout=10)
+        r.raise_for_status()
+        markets = r.json()
+
     if not markets:
         raise ValueError(
             f"No market found for '{slug}'.\n"
-            f"Check that the URL is from polymarket.com and the market is still active."
+            f"Check that the URL is from polymarket.com and the market exists."
         )
 
     m = markets[0]
@@ -175,6 +181,9 @@ def fetch_trades(
                     "takerOnly": "false",
                 }
                 r = requests.get(f"{DATA_API}/trades", params=params, timeout=15)
+                if r.status_code == 400:
+                    # Data API caps offset at ~3500; treat as end-of-data
+                    break
                 r.raise_for_status()
                 trades = r.json()
 
