@@ -248,6 +248,67 @@ def print_stats(loops: list[QuoteLoop]) -> None:
     log.info("  TOTAL PnL (approx): %.4f", total_pnl)
 
 
+async def _poll_fills_loop(
+    client: ClobClient,
+    loops: list[QuoteLoop],
+    token_to_loop: dict[str, QuoteLoop],
+    stop_event: asyncio.Event,
+    poll_interval_seconds: float = 15.0,
+) -> None:
+    """
+    Periodically poll the CLOB for new fills (live mode only).
+    Routes fill events to the appropriate QuoteLoop.
+    """
+    log = logging.getLogger("run_live")
+    from src.data.schemas import Fill, Side
+
+    seen_fill_ids: set[str] = set()
+
+    while not stop_event.is_set():
+        await asyncio.sleep(poll_interval_seconds)
+        if stop_event.is_set():
+            break
+        try:
+            # Get recent trades for the account
+            py_client = client._get_py_client()
+            raw_trades = py_client.get_trades() or []
+
+            for trade in raw_trades:
+                trade_id = trade.get("id", trade.get("transactionHash", ""))
+                if not trade_id or trade_id in seen_fill_ids:
+                    continue
+                seen_fill_ids.add(trade_id)
+
+                token_id = trade.get("asset_id", "")
+                loop = token_to_loop.get(token_id)
+                if loop is None:
+                    continue
+
+                try:
+                    fill = Fill(
+                        fill_id=trade_id,
+                        market_id=token_id,
+                        side=Side.BUY if trade.get("side", "").upper() == "BUY" else Side.SELL,
+                        price=float(trade.get("price", 0)),
+                        size=float(trade.get("size", 0)),
+                        timestamp=datetime.fromtimestamp(
+                            float(trade.get("match_time", trade.get("timestamp", 0))),
+                            tz=timezone.utc,
+                        ),
+                        is_maker=trade.get("maker_order_id") is not None,
+                    )
+                    if fill.side == Side.BUY and fill.is_maker:
+                        log.info(
+                            "[%s] FILL detected via poll: price=%.3f size=%.1f",
+                            loop.config.market_id[:40], fill.price, fill.size,
+                        )
+                        loop.on_fill(fill)
+                except Exception as exc:
+                    log.warning("Fill parse error: %s | trade=%s", exc, str(trade)[:100])
+        except Exception as exc:
+            log.warning("Fill poll error: %s", exc)
+
+
 async def main_async(args: argparse.Namespace) -> None:
     log = logging.getLogger("run_live")
 
@@ -339,23 +400,32 @@ async def main_async(args: argparse.Namespace) -> None:
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    # Run feed until stop
+    # Run feed until stop, with periodic fill polling for live mode
     feed_task = asyncio.create_task(feed.run())
+
+    if args.live:
+        fill_poll_task = asyncio.create_task(
+            _poll_fills_loop(client, loops, token_to_loop, stop_event)
+        )
+    else:
+        fill_poll_task = None
 
     log.info("Book feed started. Waiting for market data...")
     try:
-        await asyncio.wait_for(stop_event.wait(), timeout=None)
-    except asyncio.TimeoutError:
-        pass
+        await stop_event.wait()
     except asyncio.CancelledError:
         pass
     finally:
         feed.stop()
         feed_task.cancel()
-        try:
-            await feed_task
-        except asyncio.CancelledError:
-            pass
+        if fill_poll_task:
+            fill_poll_task.cancel()
+        for task in [feed_task, fill_poll_task]:
+            if task:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     print_stats(loops)
     log.info("Shutdown complete.")
