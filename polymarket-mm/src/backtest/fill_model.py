@@ -54,11 +54,16 @@ class FillModel:
 
     def simulate_fill(self, inp: FillModelInput) -> FillModelResult:
         """
-        Given a market trade event, compute how much of our resting quote gets filled.
-        Returns filled_size=0 if the market trade doesn't touch our price.
+        Given a market trade event, compute how much of our resting BID gets filled.
+
+        A passive bid at price B is filled when a market sell arrives at price P ≤ B —
+        i.e. the market came down to our level or below.  Exact-price matching is wrong
+        here because the market maker posts *below* the current mid and waits.
+
+        Returns filled_size=0 if the trade price is above our bid.
         """
-        # Price must match exactly (tick-level backtesting)
-        if abs(inp.market_trade_price - inp.quote_price) > 1e-9:
+        # Fill only when the market trades at or below our bid
+        if inp.market_trade_price > inp.quote_price + 1e-9:
             return FillModelResult(filled_size=0.0, fill_price=inp.quote_price,
                                    latency_ms=self.config.latency_ms)
 
