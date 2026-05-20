@@ -290,6 +290,18 @@ def main():
     n = fetch_trades(condition_id, token_id, since_ts, out_path, args.spread, args.book_size)
     print(f"Done. {n} trades written (+ {n} synthetic book snapshots) to {out_path}")
 
+    # Save sidecar with condition_id so live tools can resolve YES/NO token pair
+    sidecar_path = out_dir / f"{token_id}.json"
+    if not sidecar_path.exists():
+        sidecar = {
+            "condition_id": condition_id,
+            "yes_token_id": token_id,
+            "title": title,
+        }
+        with sidecar_path.open("w") as sf:
+            json.dump(sidecar, sf, indent=2)
+        print(f"Saved sidecar -> {sidecar_path}")
+
 
 if __name__ == "__main__":
     main()
