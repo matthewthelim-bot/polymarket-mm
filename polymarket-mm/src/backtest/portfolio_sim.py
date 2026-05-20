@@ -75,16 +75,22 @@ class PortfolioSimulator:
 
         # Estimate peak capital at risk.
         # Each fill uses approximately fill_price * quote_size capital.
-        # With hourly data, at most one position open per market at a time.
-        # Conservative estimate: assume all markets had a position simultaneously.
+        # With max_concurrent_positions slices per market, multiply accordingly.
+        # Conservative estimate: assume all markets had full concurrent positions simultaneously.
         n_markets = len(self.run_configs)
         avg_quote_size = (
             sum(c.quote_size for c in self.run_configs) / n_markets
             if n_markets > 0 else 100.0
         )
+        avg_concurrent = (
+            sum(getattr(c, "max_concurrent_positions", 1) for c in self.run_configs) / n_markets
+            if n_markets > 0 else 1.0
+        )
         # Average fill price ~0.5 for near-50/50 markets; use 0.5 as conservative default
         avg_fill_price = 0.5
-        result.estimated_peak_capital_at_risk = n_markets * avg_fill_price * avg_quote_size
+        result.estimated_peak_capital_at_risk = (
+            n_markets * avg_concurrent * avg_fill_price * avg_quote_size
+        )
         result.capital_utilization_pct = (
             result.estimated_peak_capital_at_risk / result.total_capital
             if result.total_capital > 0 else 0.0

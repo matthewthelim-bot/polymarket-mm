@@ -7,6 +7,13 @@ On each trade event: checks if our resting quote would have been filled (fill mo
 When filled: records inventory, triggers hedge assessment.
 When book arrives with pending entry: attempts flatten.
 
+Iceberg / concurrent positions:
+    SimulatorConfig.max_concurrent_positions controls how many independent
+    resting slices we can hold simultaneously (default 1 = classic single-entry).
+    With max_concurrent_positions=N the simulator keeps re-quoting a new slice
+    as long as open_positions < N, simulating an iceberg order that always
+    shows a fresh small quote to the market.
+
 Uses the same FeeModel instance as all strategy components.
 No separate fee approximations.
 """
@@ -47,6 +54,7 @@ class SimulatorConfig:
     adverse_selection_window_seconds: float = 300.0
     adverse_selection_adverse_threshold: float = 0.005
     quote_staleness_threshold: float = 0.0  # 0 = disabled; e.g. 0.01 = 1 cent
+    max_concurrent_positions: int = 1       # iceberg slices: always re-quote until this many open
 
 
 @dataclass
@@ -120,7 +128,7 @@ class BacktestSimulator:
         self.config = config
 
         self._current_book: OrderBook | None = None
-        self._pending_entry: _PendingEntry | None = None
+        self._pending_entries: list[_PendingEntry] = []
         self._as_estimate: float = 0.0
         self._last_fv: float | None = None
         self._as_tracker = AdverseSelectionTracker(
@@ -132,7 +140,7 @@ class BacktestSimulator:
     def run(self, events: list[Event]) -> SimulationResult:
         self._result = SimulationResult()
         self._current_book = None
-        self._pending_entry = None
+        self._pending_entries = []
         self._as_estimate = 0.0
         self._last_fv = None
         self._as_tracker = AdverseSelectionTracker(
@@ -145,10 +153,8 @@ class BacktestSimulator:
             elif isinstance(event, Fill):
                 self._on_trade(event)
 
-        # Record unrealized open position
-        if self._pending_entry is not None:
-            self._result.num_open_positions = 1  # pending but unclosed
-            # Don't call compute_settlement — resolution price unknown in backtest
+        # Record unrealized open positions (positions that never flattened)
+        self._result.num_open_positions = len(self._pending_entries)
 
         # Finalize adverse-selection stats
         stats = self._as_tracker.stats()
@@ -165,9 +171,9 @@ class BacktestSimulator:
         self._current_book = book
         self._result.num_book_updates += 1
 
-        # Attempt flatten if we have pending inventory
-        if self._pending_entry is not None:
-            self._attempt_flatten(book)
+        # Attempt flatten for each open iceberg slice
+        for entry_obj in list(self._pending_entries):
+            self._attempt_flatten(book, entry_obj)
 
     def _on_trade(self, trade: Fill) -> None:
         """Process a market trade observation.
@@ -180,12 +186,14 @@ class BacktestSimulator:
         A resting order is posted at a fixed price computed from FV *before* this trade
         arrives. Checking fills after absorbing the trade would use a stale price.
         """
-        # 1a. Try to flatten an existing pending position via this trade (pre-FV-update)
-        if self._pending_entry is not None and self._current_book is not None:
-            self._attempt_flatten_via_trade(trade)
+        # 1a. Try to flatten each open iceberg slice via this trade (pre-FV-update)
+        if self._current_book is not None:
+            for entry_obj in list(self._pending_entries):
+                self._attempt_flatten_via_trade(trade, entry_obj)
 
-        # 1b. If no pending position, check whether this trade fills our resting bid.
-        if self._pending_entry is None and self._current_book is not None:
+        # 1b. If below max concurrent positions, check whether this trade fills a new slice.
+        open_count = len(self._pending_entries)
+        if open_count < self.config.max_concurrent_positions and self._current_book is not None:
             fv = self.fv_estimator.estimate(as_of=trade.timestamp)
             if fv is not None:
                 # Staleness check: skip fill if FV jumped since last check
@@ -257,7 +265,7 @@ class BacktestSimulator:
             is_maker=True,
         )
         self.inventory_manager.add_fill(sim_fill, is_skew=is_skew)
-        self._pending_entry = _PendingEntry(fill=sim_fill, is_skew=is_skew)
+        self._pending_entries.append(_PendingEntry(fill=sim_fill, is_skew=is_skew))
         self._as_tracker.on_fill(sim_fill.price, sim_fill.timestamp)
 
     # ------------------------------------------------------------------
@@ -331,14 +339,12 @@ class BacktestSimulator:
     # Flatten logic
     # ------------------------------------------------------------------
 
-    def _attempt_flatten(self, book: OrderBook) -> None:
-        """Try to flatten pending entry against the best ask in `book`."""
-        if self._pending_entry is None:
-            return
+    def _attempt_flatten(self, book: OrderBook, entry_obj: _PendingEntry) -> None:
+        """Try to flatten a single iceberg slice against the best ask in `book`."""
         if not book.asks:
             return
 
-        entry = self._pending_entry.fill
+        entry = entry_obj.fill
         flatten_price = book.asks[0].price
         p_max = self.fee_model.max_flatten_price(
             p_fill=entry.price,
@@ -352,14 +358,11 @@ class BacktestSimulator:
         flatten_size = min(entry.size, book.asks[0].size)
         if flatten_size <= 0:
             return
-        self._record_flatten(entry, flatten_price, flatten_size)
+        self._record_flatten(entry_obj, flatten_price, flatten_size)
 
-    def _attempt_flatten_via_trade(self, trade: Fill) -> None:
-        """Try to flatten by treating the incoming trade as a taker opportunity."""
-        if self._pending_entry is None:
-            return
-
-        entry = self._pending_entry.fill
+    def _attempt_flatten_via_trade(self, trade: Fill, entry_obj: _PendingEntry) -> None:
+        """Try to flatten a single slice by treating the incoming trade as a taker opportunity."""
+        entry = entry_obj.fill
         p_max = self.fee_model.max_flatten_price(
             p_fill=entry.price,
             fee_rate=self.meta.fee_rate,
@@ -378,19 +381,20 @@ class BacktestSimulator:
         flatten_size = min(entry.size, self._current_book.asks[0].size)
         if flatten_size <= 0:
             return
-        self._record_flatten(entry, flatten_price, flatten_size)
+        self._record_flatten(entry_obj, flatten_price, flatten_size)
 
     def _record_flatten(
-        self, entry: Fill, flatten_price: float, flatten_size: float
+        self, entry_obj: _PendingEntry, flatten_price: float, flatten_size: float
     ) -> None:
-        """Record a flatten, compute PnL, update inventory."""
+        """Record a flatten for one iceberg slice, compute PnL, update inventory."""
+        entry = entry_obj.fill
         cycle = CompletedCycle(
             market_id=self.meta.condition_id,
             entry_price=entry.price,
             entry_size=entry.size,
             flatten_price=flatten_price,
             flatten_size=flatten_size,
-            is_skew=self._pending_entry.is_skew if self._pending_entry else False,
+            is_skew=entry_obj.is_skew,
         )
         cycle_result = self.pnl_engine.compute_cycle(cycle)
         net_cycle_pnl = cycle_result.spread_pnl + cycle_result.skew_pnl
@@ -404,4 +408,4 @@ class BacktestSimulator:
             self._result.num_profitable_cycles += 1
 
         self.inventory_manager.add_flatten(flatten_size, flatten_price)
-        self._pending_entry = None
+        self._pending_entries.remove(entry_obj)

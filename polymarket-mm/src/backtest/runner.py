@@ -52,6 +52,7 @@ class RunConfig:
     adverse_selection_window_seconds: float = 300.0
     adverse_selection_adverse_threshold: float = 0.005
     quote_staleness_threshold: float = 0.0
+    max_concurrent_positions: int = 1
     skew_tolerance: float = 0.0
     skew_edge_premium: float = 0.005
     skew_hard_limit: int = 0
@@ -163,6 +164,7 @@ class BacktestRunner:
                 adverse_selection_window_seconds=cfg.adverse_selection_window_seconds,
                 adverse_selection_adverse_threshold=cfg.adverse_selection_adverse_threshold,
                 quote_staleness_threshold=cfg.quote_staleness_threshold,
+                max_concurrent_positions=cfg.max_concurrent_positions,
             ),
         )
 

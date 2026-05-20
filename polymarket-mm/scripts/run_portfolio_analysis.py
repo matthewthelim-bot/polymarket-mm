@@ -44,6 +44,7 @@ def load_market_configs(
     quote_staleness_threshold: float,
     skew_tolerance: float,
     skew_edge_premium: float,
+    max_concurrent_positions: int,
 ) -> list[RunConfig]:
     configs = []
     for jsonl_path in sorted(data_dir.glob("*.jsonl")):
@@ -77,6 +78,7 @@ def load_market_configs(
             skew_edge_premium=skew_edge_premium,
             skew_hard_limit=skew_hard_limit,
             max_skew_notional=max_skew_notional,
+            max_concurrent_positions=max_concurrent_positions,
         )
         configs.append(cfg)
     return configs
@@ -146,6 +148,8 @@ def main():
                         help="Max unhedgeable contracts to accept as skew inventory (0 = disabled)")
     parser.add_argument("--skew-edge-premium", type=float, default=0.005,
                         help="Extra edge required on skew quotes above min_edge_floor (default 0.005)")
+    parser.add_argument("--max-concurrent", type=int, default=1,
+                        help="Max concurrent iceberg slices per market (default 1 = no iceberg)")
     args = parser.parse_args()
 
     data_dir = Path(args.data)
@@ -163,6 +167,7 @@ def main():
         quote_staleness_threshold=args.staleness_threshold,
         skew_tolerance=args.skew_tolerance,
         skew_edge_premium=args.skew_edge_premium,
+        max_concurrent_positions=args.max_concurrent,
     )
 
     if not configs:
