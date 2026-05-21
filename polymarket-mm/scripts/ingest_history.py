@@ -292,7 +292,6 @@ def ingest_one(
     Returns a result dict with keys: market_input, condition_id, token_id,
     title, n_trades, skipped (bool), error (str or None).
     """
-    from datetime import datetime, timezone, timedelta
     if since_str:
         since_dt = datetime.strptime(since_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     else:
@@ -395,6 +394,7 @@ def _bulk_ingest_from_universe(
                     # Mark as ingested in universe
                     m = universe.get(condition_id)
                     if m:
+                        # universe.update() called only in this (main) thread — intentionally serialised
                         universe.update(dc_replace(m, ingested=True))
             except Exception as exc:
                 print(f"  Worker error: {exc}", file=sys.stderr)
@@ -439,6 +439,8 @@ def main():
     args = parser.parse_args()
 
     if args.from_universe:
+        if args.since:
+            print("Warning: --since is ignored with --from-universe; use --days instead", file=sys.stderr)
         _bulk_ingest_from_universe(
             universe_path=Path(args.from_universe),
             out_dir=Path(args.out),
