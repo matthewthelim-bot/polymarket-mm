@@ -88,15 +88,20 @@ def build_universe(
         q_safe = q.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(sys.stdout.encoding or "utf-8", errors="replace")
         print(f"  [{i+1:>4}/{len(markets)}] {q_safe:<55}", end="\r", flush=True)
 
-        scan = scan_one(
-            market=market,
-            client=client,
-            exit_checker=exit_checker,
-            half_spread=half_spread,
-            min_price=0.03,
-            max_price=0.97,
-            fetch_vol=use_volatility,
-        )
+        try:
+            scan = scan_one(
+                market=market,
+                client=client,
+                exit_checker=exit_checker,
+                half_spread=half_spread,
+                min_price=0.03,
+                max_price=0.97,
+                fetch_vol=use_volatility,
+            )
+        except Exception as exc:
+            condition_id = market.get("conditionId", "?")
+            print(f"\n  Warning: scan_one failed for {condition_id[:20]}: {exc}", file=sys.stderr)
+            continue
         scans.append(scan)
 
         if delay > 0:
@@ -124,8 +129,8 @@ def build_universe(
             try:
                 end_dt = datetime.fromisoformat(scan.end_date).replace(tzinfo=timezone.utc)
                 days_remaining = (end_dt - datetime.now(timezone.utc)).total_seconds() / 86400.0
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"  Warning: unparseable end_date {scan.end_date!r}: {exc}", file=sys.stderr)
 
         if days_remaining <= 1.0:
             status = "expired"
