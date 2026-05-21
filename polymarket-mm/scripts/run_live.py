@@ -156,9 +156,11 @@ def build_quote_loop(
         max_concurrent_positions=args.max_concurrent,
         time_to_resolution_hours=args.time_to_resolution,
         max_loss_fraction=args.max_loss,
+        iceberg_levels=args.iceberg_levels,
+        iceberg_level_tick=args.iceberg_tick,
         min_viable_size=1.0,
         price_tolerance=0.005,
-        order_ttl_seconds=300.0,
+        order_ttl_seconds=args.order_ttl,
         adverse_selection_threshold=0.012,
         daily_capital_charge_rate=0.0003,
         dry_run=not args.live,
@@ -218,6 +220,80 @@ def seed_fv_from_recent_trades(
             count, fv or 0.0, loop.config.market_id[:50],
         )
     return count
+
+
+def load_active_from_universe(universe_path: Path) -> list[dict]:
+    """
+    Return list of dicts with keys: condition_id, yes_token, no_token, question.
+    Only returns active, ingested markets from universe.json.
+    """
+    from src.data.universe import MarketUniverse
+    u = MarketUniverse()
+    u.load(universe_path)
+    return [
+        {
+            "condition_id": m.condition_id,
+            "yes_token": m.yes_token,
+            "no_token": m.no_token,
+            "question": m.question,
+        }
+        for m in u.active_markets()
+        if m.ingested
+    ]
+
+
+def _universe_watcher(
+    universe_path: Path,
+    loops: list,
+    token_to_loop: dict,
+    client,
+    fee_model,
+    args: argparse.Namespace,
+    stop_event,
+    poll_interval: float = 60.0,
+) -> None:
+    """
+    Background thread: polls universe.json every poll_interval seconds.
+    Adds QuoteLoops for newly active+ingested markets.
+    Does not remove loops for expired markets (let them drain naturally).
+    """
+    import threading
+    log = logging.getLogger("universe_watcher")
+    known_condition_ids: set[str] = {loop.config.condition_id for loop in loops}
+
+    while not stop_event.is_set():
+        stop_event.wait(timeout=poll_interval)
+        if stop_event.is_set():
+            break
+        try:
+            entries = load_active_from_universe(universe_path)
+            for entry in entries:
+                cid = entry["condition_id"]
+                if cid in known_condition_ids:
+                    continue
+                # New market — spin up a QuoteLoop
+                yes_token = entry["yes_token"]
+                no_token = entry["no_token"]
+                question = entry["question"][:80]
+                log.info("New market detected: %s", question[:60])
+
+                loop = build_quote_loop(
+                    yes_token=yes_token,
+                    no_token=no_token,
+                    condition_id=cid,
+                    title=question,
+                    client=client,
+                    fee_model=fee_model,
+                    args=args,
+                )
+                seed_fv_from_recent_trades(loop, cid, yes_token)
+
+                loops.append(loop)
+                token_to_loop[yes_token] = loop
+                known_condition_ids.add(cid)
+                log.info("QuoteLoop started for %s", question[:60])
+        except Exception as exc:
+            log.warning("Universe watcher error: %s", exc)
 
 
 def print_startup_banner(loops: list[QuoteLoop], dry_run: bool) -> None:
@@ -328,36 +404,55 @@ async def main_async(args: argparse.Namespace) -> None:
     fee_model = FeeModel()
 
     # Discover markets
-    if args.markets:
+    if args.universe:
+        entries = load_active_from_universe(Path(args.universe))
+        if not entries:
+            log.error("No active+ingested markets found in %s", args.universe)
+            sys.exit(1)
+        log.info("Universe mode: %d active markets from %s", len(entries), args.universe)
+        market_paths = None
+    elif args.markets:
         market_paths = [Path(m) for m in args.markets]
+        entries = None
     else:
         data_dir = Path(args.data)
         if not data_dir.exists():
             log.error("Data directory %s not found", data_dir)
             sys.exit(1)
         market_paths = discover_markets(data_dir)
+        entries = None
 
-    if not market_paths:
-        log.error("No markets found. Use --data or --markets.")
+    if not args.universe and not market_paths:
+        log.error("No markets found. Use --universe, --data, or --markets.")
         sys.exit(1)
 
-    log.info("Resolving %d markets...", len(market_paths))
-
-    # Resolve tokens for each market
     loops: list[QuoteLoop] = []
     token_ids: list[str] = []
-    for path in market_paths:
-        result = resolve_market_tokens(path, client)
-        if result is None:
-            log.warning("Skipping unresolvable market: %s", path.stem[:40])
-            continue
-        yes_token, no_token, condition_id, title = result
-        loop = build_quote_loop(
-            yes_token, no_token, condition_id, title, client, fee_model, args
-        )
-        loops.append(loop)
-        token_ids.extend([yes_token, no_token])
-        time.sleep(0.1)   # rate limit resolution calls
+
+    if args.universe:
+        # Universe mode: tokens come directly from universe.json
+        for entry in entries:
+            yes_token = entry["yes_token"]
+            no_token = entry["no_token"]
+            condition_id = entry["condition_id"]
+            title = entry["question"][:80]
+            loop = build_quote_loop(yes_token, no_token, condition_id, title, client, fee_model, args)
+            loops.append(loop)
+            token_ids.extend([yes_token, no_token])
+            time.sleep(0.05)
+    else:
+        # Existing path: resolve from .jsonl files
+        log.info("Resolving %d markets...", len(market_paths))
+        for path in market_paths:
+            result = resolve_market_tokens(path, client)
+            if result is None:
+                log.warning("Skipping unresolvable market: %s", path.stem[:40])
+                continue
+            yes_token, no_token, condition_id, title = result
+            loop = build_quote_loop(yes_token, no_token, condition_id, title, client, fee_model, args)
+            loops.append(loop)
+            token_ids.extend([yes_token, no_token])
+            time.sleep(0.1)
 
     if not loops:
         log.error("No markets could be resolved. Exiting.")
@@ -388,7 +483,19 @@ async def main_async(args: argparse.Namespace) -> None:
         if loop:
             loop.on_yes_book_update(token_id, book)
 
+    def on_trade_update(token_id: str, price: float, size: float):
+        loop = token_to_loop.get(token_id)
+        if loop is None:
+            return
+        obs = TradeObservation(
+            price=price,
+            size=size,
+            timestamp=datetime.now(timezone.utc),
+        )
+        loop._fv_estimator.on_trade(obs)
+
     feed.on_any_book_update(on_book_update)
+    feed.on_any_trade(on_trade_update)
 
     # Graceful shutdown
     stop_event = asyncio.Event()
@@ -409,6 +516,42 @@ async def main_async(args: argparse.Namespace) -> None:
         )
     else:
         fill_poll_task = None
+
+    # Universe watcher: polls universe.json for new markets every 60s
+    watcher_thread = None
+    if args.universe:
+        import threading
+
+        def _watch_thread():
+            import time as _time
+            log_w = logging.getLogger("universe_watcher")
+            known_condition_ids: set[str] = {loop.config.condition_id for loop in loops}
+            while not stop_event.is_set():
+                _time.sleep(60)
+                if stop_event.is_set():
+                    break
+                try:
+                    entries_new = load_active_from_universe(Path(args.universe))
+                    for entry in entries_new:
+                        cid = entry["condition_id"]
+                        if cid in known_condition_ids:
+                            continue
+                        yes_token = entry["yes_token"]
+                        no_token = entry["no_token"]
+                        question = entry["question"][:80]
+                        log_w.info("New market detected: %s", question[:60])
+                        loop = build_quote_loop(yes_token, no_token, cid, question, client, fee_model, args)
+                        seed_fv_from_recent_trades(loop, cid, yes_token)
+                        loops.append(loop)
+                        token_to_loop[yes_token] = loop
+                        known_condition_ids.add(cid)
+                        log_w.info("QuoteLoop started for %s", question[:60])
+                except Exception as exc:
+                    log_w.warning("Watcher error: %s", exc)
+
+        watcher_thread = threading.Thread(target=_watch_thread, daemon=True, name="universe-watcher")
+        watcher_thread.start()
+        log.info("Universe watcher started (polling every 60s)")
 
     log.info("Book feed started. Waiting for market data...")
     try:
@@ -445,6 +588,10 @@ def main():
         "--markets", nargs="+",
         help="Specific .jsonl paths to trade (overrides --data)"
     )
+    parser.add_argument(
+        "--universe", type=str, default=None,
+        help="Path to universe.json — trade all active+ingested markets dynamically"
+    )
     parser.add_argument("--quote-size", type=float, default=100.0)
     parser.add_argument("--half-spread", type=float, default=0.030)
     parser.add_argument("--fee-rate", type=float, default=0.07)
@@ -455,6 +602,12 @@ def main():
                         help="Hours to resolution (default 720 = 30 days)")
     parser.add_argument("--max-loss", type=float, default=0.10,
                         help="Max YES exit loss fraction (default 0.10)")
+    parser.add_argument("--iceberg-levels", type=int, default=1,
+                        help="Number of price levels to quote simultaneously (default 1 = no iceberging)")
+    parser.add_argument("--iceberg-tick", type=float, default=0.01,
+                        help="Price spacing between iceberg layers in $ (default 0.01 = 1 cent)")
+    parser.add_argument("--order-ttl", type=float, default=300.0,
+                        help="Seconds before a resting order is cancelled and re-quoted (default 300)")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
