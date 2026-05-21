@@ -252,6 +252,8 @@ def _universe_watcher(
     stop_event,
     poll_interval: float = 60.0,
 ) -> None:
+    # NOTE: This function is NOT called. The actual watcher is the inline _watch_thread
+    # closure defined in main_async(). Kept as a standalone reference implementation.
     """
     Background thread: polls universe.json every poll_interval seconds.
     Adds QuoteLoops for newly active+ingested markets.
@@ -499,10 +501,13 @@ async def main_async(args: argparse.Namespace) -> None:
 
     # Graceful shutdown
     stop_event = asyncio.Event()
+    import threading as _threading
+    _thread_stop = _threading.Event()
 
     def _signal_handler(sig, frame):
         log.info("Shutdown signal received, stopping...")
         stop_event.set()
+        _thread_stop.set()
 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
@@ -526,9 +531,9 @@ async def main_async(args: argparse.Namespace) -> None:
             import time as _time
             log_w = logging.getLogger("universe_watcher")
             known_condition_ids: set[str] = {loop.config.condition_id for loop in loops}
-            while not stop_event.is_set():
+            while not _thread_stop.is_set():
                 _time.sleep(60)
-                if stop_event.is_set():
+                if _thread_stop.is_set():
                     break
                 try:
                     entries_new = load_active_from_universe(Path(args.universe))
@@ -545,7 +550,12 @@ async def main_async(args: argparse.Namespace) -> None:
                         loops.append(loop)
                         token_to_loop[yes_token] = loop
                         known_condition_ids.add(cid)
-                        log_w.info("QuoteLoop started for %s", question[:60])
+                        feed.add_token(yes_token)
+                        feed.add_token(no_token)
+                        log_w.info(
+                            "QuoteLoop started for %s (will subscribe on next WS reconnect)",
+                            question[:60],
+                        )
                 except Exception as exc:
                     log_w.warning("Watcher error: %s", exc)
 
@@ -559,6 +569,7 @@ async def main_async(args: argparse.Namespace) -> None:
     except asyncio.CancelledError:
         pass
     finally:
+        _thread_stop.set()
         feed.stop()
         feed_task.cancel()
         if fill_poll_task:
