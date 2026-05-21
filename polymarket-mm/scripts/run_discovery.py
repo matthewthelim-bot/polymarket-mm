@@ -25,6 +25,7 @@ import argparse
 import logging
 import signal
 import sys
+import threading
 import time
 from dataclasses import replace as dc_replace
 from pathlib import Path
@@ -149,11 +150,13 @@ def main() -> None:
     out_dir = Path(args.out)
 
     stop = False
+    _stop_event = threading.Event()
 
     def _handle_signal(sig, frame):
         nonlocal stop
         log.info("Shutdown signal received, stopping after current cycle...")
         stop = True
+        _stop_event.set()
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -164,6 +167,7 @@ def main() -> None:
     )
 
     while not stop:
+        cycle_start = time.monotonic()
         try:
             run_one_cycle(
                 universe_path=universe_path,
@@ -181,12 +185,14 @@ def main() -> None:
         if args.once or stop:
             break
 
-        log.info("Sleeping %ds until next cycle...", args.interval)
-        # Sleep in 10s increments to remain responsive to Ctrl-C
-        elapsed = 0
-        while elapsed < args.interval and not stop:
-            time.sleep(min(10, args.interval - elapsed))
-            elapsed += 10
+        elapsed_cycle = time.monotonic() - cycle_start
+        sleep_for = max(0, args.interval - elapsed_cycle)
+        log.info(
+            "Cycle took %.0fs. Sleeping %.0fs until next cycle...",
+            elapsed_cycle, sleep_for,
+        )
+        _stop_event.wait(timeout=sleep_for)
+        _stop_event.clear()
 
     log.info("Discovery daemon stopped.")
 
