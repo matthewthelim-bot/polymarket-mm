@@ -460,7 +460,7 @@ def main():
         since_str=args.since,
         spread=args.spread,
         book_size=args.book_size,
-        skip_existing=False,  # single-market call: always ingest
+        skip_existing=args.skip_existing,
         verbose=True,
     )
     if result["error"]:
