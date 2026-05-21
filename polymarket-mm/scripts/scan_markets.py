@@ -603,6 +603,7 @@ def main():
             and s.max_quotable >= args.min_quotable
             and s.volume_24h >= args.min_volume
             and (args.min_std <= 0 or s.volatility_std >= args.min_std)
+            and (args.min_trades_day <= 0 or s.trades_per_day >= args.min_trades_day)
         ]
         export_data = [dataclasses.asdict(s) for s in export_viable]
         export_path.write_text(json.dumps(export_data, indent=2), encoding="utf-8")
