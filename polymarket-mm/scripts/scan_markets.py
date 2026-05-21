@@ -102,8 +102,14 @@ def fetch_active_markets(
     results = []
     offset = 0
     page_size = 500
+    MAX_PAGES = 200
+    page_num = 0
 
     while True:
+        page_num += 1
+        if page_num > MAX_PAGES:
+            print(f"  Warning: hit {MAX_PAGES}-page safety limit, stopping pagination", file=sys.stderr)
+            break
         params: dict = {
             "active": "true",
             "closed": "false",
@@ -185,7 +191,6 @@ def fetch_volatility(condition_id: str, yes_token_id: str, n_trades: int = 200) 
     Returns (volatility_std, trades_per_day). Returns (0.0, 0.0) on error.
     """
     import math
-    from datetime import datetime, timezone
     try:
         r = requests.get(
             f"{DATA_API}/trades",
@@ -233,13 +238,17 @@ def fetch_volatility(condition_id: str, yes_token_id: str, n_trades: int = 200) 
 def compute_score(volume_24h: float, max_quotable: float, volatility_std: float = 0.0) -> float:
     """
     Composite score: log(volume+1) * max_quotable * volatility_multiplier.
-    volatility_multiplier = min(std/0.05, 2.0) — rewards oscillating markets.
+    volatility_multiplier = min(std/0.05, 2.0) when std is known; 1.0 (neutral) when std=0 (not fetched).
     Returns 0 if max_quotable=0 (no exit liquidity).
     """
     import math
     if max_quotable <= 0:
         return 0.0
-    volatility_multiplier = min(volatility_std / 0.05, 2.0)
+    if volatility_std <= 0:
+        # No volatility data: use neutral multiplier (don't penalise or reward)
+        volatility_multiplier = 1.0
+    else:
+        volatility_multiplier = min(volatility_std / 0.05, 2.0)
     return math.log1p(volume_24h) * max_quotable * volatility_multiplier
 
 
@@ -386,12 +395,16 @@ def print_report(
     show_ingest: bool,
     half_spread: float,
     sort_by: str,
+    min_std: float = 0.0,
+    min_trades_day: float = 0.0,
 ) -> None:
     viable = [
         s for s in scans
         if s.viable
         and s.max_quotable >= min_quotable
         and s.volume_24h >= min_volume
+        and (min_std <= 0 or s.volatility_std >= min_std)
+        and (min_trades_day <= 0 or s.trades_per_day >= min_trades_day)
     ]
 
     sort_keys = {
@@ -584,7 +597,14 @@ def main():
         import dataclasses
         export_path = Path(args.export)
         export_path.parent.mkdir(parents=True, exist_ok=True)
-        export_data = [dataclasses.asdict(s) for s in scans if s.viable]
+        export_viable = [
+            s for s in scans
+            if s.viable
+            and s.max_quotable >= args.min_quotable
+            and s.volume_24h >= args.min_volume
+            and (args.min_std <= 0 or s.volatility_std >= args.min_std)
+        ]
+        export_data = [dataclasses.asdict(s) for s in export_viable]
         export_path.write_text(json.dumps(export_data, indent=2), encoding="utf-8")
         print(f"Exported {len(export_data)} viable markets -> {args.export}")
 
@@ -596,6 +616,8 @@ def main():
         show_ingest=args.ingest,
         half_spread=args.half_spread,
         sort_by=args.sort,
+        min_std=args.min_std,
+        min_trades_day=args.min_trades_day,
     )
 
 

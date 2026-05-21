@@ -9,9 +9,13 @@ def test_score_zero_when_no_quotable():
     assert compute_score(50000.0, 0.0, 0.1) == 0.0
 
 
-def test_score_zero_when_no_volatility():
-    # std=0 → volatility_multiplier=0 → score=0
-    assert compute_score(50000.0, 100.0, 0.0) == 0.0
+def test_score_neutral_when_no_volatility():
+    # std=0 → neutral multiplier (1.0), not zero
+    import math
+    s = compute_score(50000.0, 100.0, 0.0)
+    expected = math.log1p(50000.0) * 100.0 * 1.0
+    assert s == pytest.approx(expected)
+    assert s > 0
 
 
 def test_score_below_threshold_std():
