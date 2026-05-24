@@ -136,15 +136,22 @@ def fetch_active_markets(
         if not page:
             break
 
+        page_had_qualifying = False
         for m in page:
             if min_volume > 0:
                 vol = float(m.get("volume", m.get("volume24hr", 0)) or 0)
                 if vol < min_volume:
                     continue
             results.append(m)
+            page_had_qualifying = True
 
         if len(page) < PAGE_SIZE:
             break   # last page (returned fewer than requested)
+
+        # Markets are sorted by volume descending — once an entire page is below
+        # the threshold, all subsequent pages will be too. Stop early.
+        if min_volume > 0 and not page_had_qualifying:
+            break
 
         offset += PAGE_SIZE
 

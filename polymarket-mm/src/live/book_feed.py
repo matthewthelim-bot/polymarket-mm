@@ -200,9 +200,9 @@ class BookFeed:
             ping_timeout=self._config.ping_timeout_seconds,
         ) as ws:
             # Subscribe to market book channel for all tokens.
-            # Polymarket's WS server silently drops subscriptions in very large
-            # single messages, so chunk into batches of 500 tokens.
-            CHUNK = 500
+            # Polymarket's WS server rejects messages over 1MB, so chunk into
+            # small batches. 100 tokens * ~140 bytes each = ~14KB per message.
+            CHUNK = 100
             token_ids = list(self._token_ids)
             for i in range(0, len(token_ids), CHUNK):
                 chunk = token_ids[i:i + CHUNK]
