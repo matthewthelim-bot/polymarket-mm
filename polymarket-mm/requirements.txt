@@ -1,4 +1,6 @@
 requests>=2.31.0
+websockets>=12.0
+py_clob_client>=0.20.0
 pyyaml>=6.0.1
 scipy>=1.12.0
 pytest>=8.0.0
