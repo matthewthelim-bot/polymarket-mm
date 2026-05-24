@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 BookCallback = Callable[[str, OrderBook], None]   # (token_id, book) -> None
+TradeCallback = Callable[[str, float, float], None]  # (token_id, price, size) -> None
 
 
 @dataclass
@@ -79,6 +80,7 @@ class BookFeed:
         self._books: dict[str, OrderBook] = {}
         self._callbacks: dict[str, list[BookCallback]] = defaultdict(list)
         self._global_callbacks: list[BookCallback] = []
+        self._global_trade_callbacks: list[TradeCallback] = []
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -99,6 +101,10 @@ class BookFeed:
     def on_any_book_update(self, callback: BookCallback) -> None:
         """Register a callback that fires on any book update."""
         self._global_callbacks.append(callback)
+
+    def on_any_trade(self, callback: TradeCallback) -> None:
+        """Register a callback that fires on every last_trade_price event."""
+        self._global_trade_callbacks.append(callback)
 
     def get_book(self, token_id: str) -> Optional[OrderBook]:
         """Return the current best-known OrderBook for a token, or None."""
@@ -193,16 +199,21 @@ class BookFeed:
             ping_interval=self._config.ping_interval_seconds,
             ping_timeout=self._config.ping_timeout_seconds,
         ) as ws:
-            # Subscribe to market book channel for all tokens
-            # Polymarket WS /ws/market subscription format:
-            # {"assets_ids": [...], "type": "Market"}
-            sub_msg = json.dumps({
-                "assets_ids": self._token_ids,
-                "type": "Market",
-            })
-            await ws.send(sub_msg)
+            # Subscribe to market book channel for all tokens.
+            # Polymarket's WS server silently drops subscriptions in very large
+            # single messages, so chunk into batches of 500 tokens.
+            CHUNK = 500
+            token_ids = list(self._token_ids)
+            for i in range(0, len(token_ids), CHUNK):
+                chunk = token_ids[i:i + CHUNK]
+                sub_msg = json.dumps({
+                    "assets_ids": chunk,
+                    "type": "Market",
+                })
+                await ws.send(sub_msg)
             logger.info(
-                "Subscribed to book channel for %d tokens", len(self._token_ids)
+                "Subscribed to book channel for %d tokens (%d chunks)",
+                len(token_ids), (len(token_ids) + CHUNK - 1) // CHUNK,
             )
 
             async for raw_msg in ws:
@@ -230,6 +241,8 @@ class BookFeed:
                 self._handle_book_snapshot(msg)
             elif event_type == "price_change":
                 self._handle_price_change(msg)
+            elif event_type == "last_trade_price":
+                self._handle_last_trade_price(msg)
             elif event_type in ("subscribed", "info", "ack"):
                 pass  # informational, ignore
             else:
@@ -313,6 +326,24 @@ class BookFeed:
             self._books[token_id] = book
 
         self._fire_callbacks(token_id, book)
+
+    def _handle_last_trade_price(self, msg: dict) -> None:
+        """Handle a last_trade_price event — feeds real-time trade prices to FV estimators."""
+        token_id = msg.get("asset_id", "")
+        if not token_id:
+            return
+        try:
+            price = float(msg["price"])
+            size = float(msg.get("size", 0.0))
+        except (KeyError, ValueError, TypeError):
+            return
+
+        logger.debug("TRADE: token=%s... price=%.4f size=%.1f", token_id[:16], price, size)
+        for cb in self._global_trade_callbacks:
+            try:
+                cb(token_id, price, size)
+            except Exception:
+                logger.exception("Trade callback error for token %s", token_id[:20])
 
     def _fire_callbacks(self, token_id: str, book: OrderBook) -> None:
         """Invoke all registered callbacks for this token."""

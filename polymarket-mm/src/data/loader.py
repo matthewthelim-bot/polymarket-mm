@@ -44,6 +44,7 @@ class HistoricalDataLoader:
             raise FileNotFoundError(f"No data file for market {market_id}: {path}")
 
         events: list[Event] = []
+        seen_fill_ids: set[str] = set()   # deduplicate fills (CLOB returns BUY+SELL per trade)
         with path.open() as f:
             for line_num, line in enumerate(f, start=1):
                 line = line.strip()
@@ -52,8 +53,15 @@ class HistoricalDataLoader:
                 try:
                     raw = json.loads(line)
                     event = self._parse_event(raw)
-                    if event is not None:
-                        events.append(event)
+                    if event is None:
+                        continue
+                    # Deduplicate Fill events — each historical trade may appear as both
+                    # a BUY and a SELL record with the same fill_id.
+                    if isinstance(event, Fill) and event.fill_id:
+                        if event.fill_id in seen_fill_ids:
+                            continue
+                        seen_fill_ids.add(event.fill_id)
+                    events.append(event)
                 except (json.JSONDecodeError, KeyError, ValueError) as e:
                     logger.warning("Skipping malformed event on line %d: %s", line_num, e)
                     continue
@@ -75,17 +83,24 @@ class HistoricalDataLoader:
             timestamp=self._parse_ts(raw["timestamp"]),
             bids=[PriceLevel(b["price"], b["size"]) for b in raw.get("bids", [])],
             asks=[PriceLevel(a["price"], a["size"]) for a in raw.get("asks", [])],
+            token_side=raw.get("token_side", ""),
         )
 
     def _parse_fill(self, raw: dict) -> Fill:
+        raw_side = raw.get("side", "")
+        # Live data uses "YES"/"NO"; historical data uses "buy"/"sell"
+        upper = raw_side.upper()
+        token_side = upper if upper in ("YES", "NO") else ""
+        side = Side.BUY if raw_side.lower() == "buy" else Side.SELL
         return Fill(
             fill_id=raw.get("fill_id", ""),
             market_id=raw["market_id"],
-            side=Side.BUY if raw["side"].lower() == "buy" else Side.SELL,
+            side=side,
             price=float(raw["price"]),
             size=float(raw["size"]),
             timestamp=self._parse_ts(raw["timestamp"]),
             is_maker=bool(raw.get("is_maker", False)),
+            token_side=token_side,
         )
 
     @staticmethod

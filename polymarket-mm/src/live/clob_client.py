@@ -325,7 +325,7 @@ class ClobClient:
         from py_clob_client.clob_types import OrderArgs, OrderType
         py_client = self._get_py_client()
 
-        side_str = order.side.value if hasattr(order.side, "value") else str(order.side)
+        side_str = (order.side.value if hasattr(order.side, "value") else str(order.side)).upper()
 
         # Map time_in_force to OrderType
         order_type_map = {

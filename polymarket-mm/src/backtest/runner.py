@@ -39,7 +39,7 @@ class RunConfig:
     quote_size: float = 100.0
     queue_model: str = "FRONT"
     latency_ms: int = 50
-    twap_window_seconds: int = 300
+    twap_window_seconds: int = 3600  # 1-hour window; prediction markets trade infrequently
     external_weight: float = 0.0
     min_edge_floor: float = 0.005
     half_spread_base: float = 0.015

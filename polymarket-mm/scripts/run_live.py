@@ -95,12 +95,15 @@ def resolve_market_tokens(
     condition_id = sidecar.get("condition_id")
     title = sidecar.get("title", market_id[:40])
 
-    if not yes_token:
-        # Filename is the YES token (from ingest_history.py)
+    if not yes_token and not condition_id:
         if market_id.isdigit() and len(market_id) > 30:
+            # data/raw format: filename IS the YES token ID (long integer)
             yes_token = market_id
+        elif market_id.startswith("0x") and len(market_id) > 30:
+            # data/live format: filename IS the condition_id (0x hex)
+            condition_id = market_id
         else:
-            log.warning("Cannot determine YES token for %s", market_id[:40])
+            log.warning("Cannot determine YES token or condition_id for %s", market_id[:40])
             return None
 
     # Get condition_id from CLOB /book if not in sidecar
@@ -153,11 +156,9 @@ def build_quote_loop(
         half_spread_base=args.half_spread,
         min_edge_floor=args.min_edge,
         quote_size=args.quote_size,
-        max_concurrent_positions=args.max_concurrent,
+        max_open_positions=args.max_open_positions,
         time_to_resolution_hours=args.time_to_resolution,
         max_loss_fraction=args.max_loss,
-        iceberg_levels=args.iceberg_levels,
-        iceberg_level_tick=args.iceberg_tick,
         min_viable_size=1.0,
         price_tolerance=0.005,
         order_ttl_seconds=args.order_ttl,
@@ -317,10 +318,11 @@ def print_stats(loops: list[QuoteLoop]) -> None:
     for loop in loops:
         s = loop.stats
         log.info(
-            "  %-40s updates=%d quotes=%d fills=%d exits=%d pnl=%.4f errors=%d",
+            "  %-40s updates=%d quotes=%d fills=%d takers=%d mm_cycles=%d open=%d pnl=%.4f errors=%d",
             loop.config.market_id[:40],
             s.book_updates, s.quotes_computed, s.fills_received,
-            s.exits_filled, s.total_pnl, s.errors,
+            s.takers_filled, s.maker_maker_cycles, s.open_positions,
+            s.total_pnl, s.errors,
         )
         total_pnl += s.total_pnl
     log.info("  TOTAL PnL (approx): %.4f", total_pnl)
@@ -363,10 +365,13 @@ async def _poll_fills_loop(
                     continue
 
                 try:
+                    # Determine YES/NO token_side from which token was traded
+                    token_side = "YES" if token_id == loop.config.yes_token_id else "NO"
+                    trade_side = trade.get("side", "").upper()
                     fill = Fill(
                         fill_id=trade_id,
-                        market_id=token_id,
-                        side=Side.BUY if trade.get("side", "").upper() == "BUY" else Side.SELL,
+                        market_id=loop.config.condition_id,
+                        side=Side.BUY if trade_side == "BUY" else Side.SELL,
                         price=float(trade.get("price", 0)),
                         size=float(trade.get("size", 0)),
                         timestamp=datetime.fromtimestamp(
@@ -374,11 +379,14 @@ async def _poll_fills_loop(
                             tz=timezone.utc,
                         ),
                         is_maker=trade.get("maker_order_id") is not None,
+                        token_side=token_side,
                     )
-                    if fill.side == Side.BUY and fill.is_maker:
+                    # Only route our maker fills — taker fills are the hedge we placed
+                    if fill.is_maker:
                         log.info(
-                            "[%s] FILL detected via poll: price=%.3f size=%.1f",
-                            loop.config.market_id[:40], fill.price, fill.size,
+                            "[%s] MAKER FILL via poll: %s %s price=%.3f size=%.1f",
+                            loop.config.market_id[:40], token_side,
+                            fill.side.value, fill.price, fill.size,
                         )
                         loop.on_fill(fill)
                 except Exception as exc:
@@ -472,29 +480,30 @@ async def main_async(args: argparse.Namespace) -> None:
 
     print_startup_banner(loops, dry_run=not args.live)
 
-    # Build token→loop mapping for callbacks
+    # Build token→loop mapping for callbacks.
+    # Both YES and NO tokens map to the same loop — routing is done by token_id.
     token_to_loop: dict[str, QuoteLoop] = {}
     for loop in loops:
         token_to_loop[loop.config.yes_token_id] = loop
+        token_to_loop[loop.config.no_token_id] = loop
 
     # Set up book feed
     feed = BookFeed(token_ids=token_ids)
 
     def on_book_update(token_id: str, book):
         loop = token_to_loop.get(token_id)
-        if loop:
+        if loop is None:
+            return
+        if token_id == loop.config.yes_token_id:
             loop.on_yes_book_update(token_id, book)
+        else:
+            loop.on_no_book_update(token_id, book)
 
     def on_trade_update(token_id: str, price: float, size: float):
         loop = token_to_loop.get(token_id)
         if loop is None:
             return
-        obs = TradeObservation(
-            price=price,
-            size=size,
-            timestamp=datetime.now(timezone.utc),
-        )
-        loop._fv_estimator.on_trade(obs)
+        loop.on_trade(token_id, price, size)
 
     feed.on_any_book_update(on_book_update)
     feed.on_any_trade(on_trade_update)
@@ -608,15 +617,12 @@ def main():
     parser.add_argument("--fee-rate", type=float, default=0.07)
     parser.add_argument("--rebate", type=float, default=0.5)
     parser.add_argument("--min-edge", type=float, default=0.005)
-    parser.add_argument("--max-concurrent", type=int, default=1)
+    parser.add_argument("--max-open-positions", type=int, default=4,
+                        help="Pause new quotes when this many unhedged fills exist (default 4)")
     parser.add_argument("--time-to-resolution", type=float, default=720.0,
                         help="Hours to resolution (default 720 = 30 days)")
     parser.add_argument("--max-loss", type=float, default=0.10,
-                        help="Max YES exit loss fraction (default 0.10)")
-    parser.add_argument("--iceberg-levels", type=int, default=1,
-                        help="Number of price levels to quote simultaneously (default 1 = no iceberging)")
-    parser.add_argument("--iceberg-tick", type=float, default=0.01,
-                        help="Price spacing between iceberg layers in $ (default 0.01 = 1 cent)")
+                        help="Max taker hedge loss fraction tolerated before parking fill (default 0.10)")
     parser.add_argument("--order-ttl", type=float, default=300.0,
                         help="Seconds before a resting order is cancelled and re-quoted (default 300)")
     parser.add_argument("--verbose", "-v", action="store_true")

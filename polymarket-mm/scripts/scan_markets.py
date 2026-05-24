@@ -98,11 +98,15 @@ def fetch_active_markets(
     """
     Fetch active, open markets from the Gamma API.
     If all_pages=True, paginates until exhausted (ignores limit).
+
+    NOTE: The Gamma API hard-caps responses at 100 records per request regardless
+    of the limit parameter. page_size must be <= 100 for pagination to work
+    correctly — using 500 causes us to always stop after the first page.
     """
     results = []
     offset = 0
-    page_size = 500
-    MAX_PAGES = 200
+    PAGE_SIZE = 100   # Gamma API hard cap — do not raise above 100
+    MAX_PAGES = 200   # safety limit: 200 * 100 = 20,000 markets max
     page_num = 0
 
     while True:
@@ -113,7 +117,7 @@ def fetch_active_markets(
         params: dict = {
             "active": "true",
             "closed": "false",
-            "limit": page_size,
+            "limit": PAGE_SIZE,
             "offset": offset,
             "order": "volume24hr",
             "ascending": "false",
@@ -139,10 +143,10 @@ def fetch_active_markets(
                     continue
             results.append(m)
 
-        if len(page) < page_size:
-            break   # last page
+        if len(page) < PAGE_SIZE:
+            break   # last page (returned fewer than requested)
 
-        offset += page_size
+        offset += PAGE_SIZE
 
         if not all_pages and len(results) >= limit:
             break
@@ -575,7 +579,8 @@ def main():
     scans: list[MarketScan] = []
     for i, market in enumerate(markets):
         question = market.get("question", "?")[:55]
-        print(f"  [{i+1:>3}/{len(markets)}] {question:<55}", end="\r", flush=True)
+        q_safe = question.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(sys.stdout.encoding or "utf-8", errors="replace")
+        print(f"  [{i+1:>3}/{len(markets)}] {q_safe:<55}", end="\r", flush=True)
 
         scan = scan_one(
             market=market,

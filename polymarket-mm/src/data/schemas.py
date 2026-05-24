@@ -51,6 +51,7 @@ class OrderBook:
     timestamp: datetime
     bids: list[PriceLevel]   # sorted descending by price
     asks: list[PriceLevel]   # sorted ascending by price
+    token_side: str = ""     # "YES", "NO", or "" for legacy single-book data
 
     def best_bid(self) -> Optional[float]:
         return self.bids[0].price if self.bids else None
@@ -76,6 +77,7 @@ class Fill:
     timestamp: datetime
     is_maker: bool
     order_id: str = ""
+    token_side: str = ""   # "YES", "NO", or "" for legacy data
 
     def notional(self) -> float:
         return self.price * self.size

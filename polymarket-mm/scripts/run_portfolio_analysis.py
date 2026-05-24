@@ -45,6 +45,7 @@ def load_market_configs(
     skew_tolerance: float,
     skew_edge_premium: float,
     max_concurrent_positions: int,
+    twap_window_seconds: int = 3600,
 ) -> list[RunConfig]:
     configs = []
     for jsonl_path in sorted(data_dir.glob("*.jsonl")):
@@ -79,6 +80,7 @@ def load_market_configs(
             skew_hard_limit=skew_hard_limit,
             max_skew_notional=max_skew_notional,
             max_concurrent_positions=max_concurrent_positions,
+            twap_window_seconds=twap_window_seconds,
         )
         configs.append(cfg)
     return configs
@@ -94,8 +96,8 @@ def print_report(portfolio_result, configs, capital: float) -> None:
     print()
 
     print(f"{'Market ID':<20} {'Fills':>6} {'Cycles':>7} {'Win%':>6} {'PnL $':>8} "
-          f"{'HedgeAcc':>9} {'AS Rate':>7}")
-    print("-" * 80)
+          f"{'HedgeAcc':>9} {'AS Rate':>7} {'FV-Skip%':>9}")
+    print("-" * 90)
 
     for cfg in configs:
         mid = cfg.market_id
@@ -106,10 +108,14 @@ def print_report(portfolio_result, configs, capital: float) -> None:
         hedge_pct = r.hedge_accessibility() * 100
         as_rate_pct = getattr(r, "as_rate", 0.0) * 100
         pnl = r.total_pnl()
+        fv_none = getattr(r, "num_fv_none_skips", 0)
+        total_checks = r.hedge_checks_total + fv_none
+        fv_skip_pct = 100.0 * fv_none / total_checks if total_checks > 0 else 0.0
         print(f"{mid[:20]:<20} {r.num_fills:>6} {r.num_cycles_completed:>7} "
-              f"{win_pct:>5.1f}% {pnl:>8.2f} {hedge_pct:>8.1f}% {as_rate_pct:>6.1f}%")
+              f"{win_pct:>5.1f}% {pnl:>8.2f} {hedge_pct:>8.1f}% {as_rate_pct:>6.1f}%"
+              f" {fv_skip_pct:>8.1f}%")
 
-    print("-" * 80)
+    print("-" * 90)
     print()
 
     r = portfolio_result
@@ -150,6 +156,8 @@ def main():
                         help="Extra edge required on skew quotes above min_edge_floor (default 0.005)")
     parser.add_argument("--max-concurrent", type=int, default=1,
                         help="Max concurrent iceberg slices per market (default 1 = no iceberg)")
+    parser.add_argument("--twap-window", type=int, default=3600,
+                        help="FV TWAP window in seconds (default 3600 = 1h; increase for sparse markets)")
     args = parser.parse_args()
 
     data_dir = Path(args.data)
@@ -168,6 +176,7 @@ def main():
         skew_tolerance=args.skew_tolerance,
         skew_edge_premium=args.skew_edge_premium,
         max_concurrent_positions=args.max_concurrent,
+        twap_window_seconds=args.twap_window,
     )
 
     if not configs:
