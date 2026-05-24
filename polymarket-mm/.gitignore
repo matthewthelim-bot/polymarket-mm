@@ -1,0 +1,33 @@
+# Credentials — NEVER commit these
+.env
+*.pem
+*.key
+secrets/
+
+# Data — too large for git
+data/
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
