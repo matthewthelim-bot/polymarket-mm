@@ -62,8 +62,9 @@ WorkingDirectory=/opt/polymarket-mm
 EnvironmentFile=/opt/polymarket-mm/.env
 ExecStart=/opt/polymarket-mm/venv/bin/python scripts/collect_books.py \
     --out /opt/polymarket-mm/data/live \
-    --min-volume 20000 \
-    --stats-interval 300
+    --min-volume 5000 \
+    --stats-interval 300 \
+    --refresh-interval 300
 Restart=always
 RestartSec=10
 StandardOutput=journal

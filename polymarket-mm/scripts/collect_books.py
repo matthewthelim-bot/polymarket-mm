@@ -39,12 +39,30 @@ from scripts.scan_markets import fetch_active_markets, extract_token_ids
 from src.live.book_feed import BookFeed
 from src.data.schemas import OrderBook
 
+import urllib.request
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Top series to track (slug → human label).  New 5-min / daily / weekly
+# markets roll in automatically — the refresh thread discovers them.
+# ---------------------------------------------------------------------------
+TRACKED_SERIES = [
+    "btc-up-or-down-5m",
+    "btc-up-or-down-daily",
+    "eth-up-or-down-daily",
+    "mlb",
+    "btc-multi-strikes-weekly",
+    "ethereum-multi-strikes-weekly",
+    "xrp-multi-strikes-weekly",
+    "solana-multi-strikes-weekly",
+    "ufc",
+]
 
 # ---------------------------------------------------------------------------
 # Buffered file writer
@@ -157,25 +175,68 @@ def build_token_maps(
     return token_to_condition, token_to_side, condition_to_question
 
 
-def run_collector(out_dir: str, stats_interval: int, min_volume: float = 20_000.0) -> None:
+def fetch_series_markets() -> list[dict]:
+    """Fetch currently active markets from all TRACKED_SERIES.
+
+    Series markets (BTC 5-min, ETH daily, MLB game lines, etc.) rotate on a
+    fixed schedule and never appear in the standard /markets volume scan because
+    each individual window is short-lived.  We discover them by querying each
+    series directly for its active events.
+
+    Returns a flat list of Gamma market dicts, same shape as fetch_active_markets().
+    """
+    results: list[dict] = []
+    for slug in TRACKED_SERIES:
+        url = (
+            f"https://gamma-api.polymarket.com/events"
+            f"?series_slug={slug}&active=true&closed=false&limit=10"
+        )
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                events = json.loads(resp.read())
+            added = 0
+            for ev in events:
+                if ev.get("negRisk", False):
+                    continue  # skip negRisk series (e.g. Elon Tweets)
+                for m in ev.get("markets", []):
+                    if m.get("active") and not m.get("closed"):
+                        results.append(m)
+                        added += 1
+            if added:
+                logger.debug("Series %s: %d active markets", slug, added)
+        except Exception as exc:
+            logger.warning("Series fetch failed for %s: %s", slug, exc)
+    return results
+
+
+def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0,
+                  refresh_interval: int = 300) -> None:
     base_dir = Path(out_dir)
     writer = BufferedMarketWriter(base_dir)
 
     # ------------------------------------------------------------------
-    # 1. Fetch active markets above volume threshold
+    # 1. Fetch active markets (standard + series)
     # ------------------------------------------------------------------
     logger.info(
         "Fetching active markets from Gamma API (min_volume=$%.0f) ...", min_volume
     )
     markets = fetch_active_markets(all_pages=True, min_volume=min_volume)
-    logger.info("Fetched %d markets with 24h volume >= $%.0f", len(markets), min_volume)
+    logger.info("Fetched %d standard markets with 24h volume >= $%.0f", len(markets), min_volume)
 
-    token_to_condition, token_to_side, condition_to_question = build_token_maps(markets)
+    series_markets = fetch_series_markets()
+    logger.info("Fetched %d series markets from %d tracked series", len(series_markets), len(TRACKED_SERIES))
+
+    all_markets = markets + series_markets
+
+    token_to_condition, token_to_side, condition_to_question = build_token_maps(all_markets)
     all_token_ids = list(token_to_condition.keys())
     logger.info(
-        "Built token map: %d tokens across %d markets",
+        "Built token map: %d tokens across %d markets (%d standard + %d series)",
         len(all_token_ids),
         len(condition_to_question),
+        len(markets),
+        len(series_markets),
     )
 
     if not all_token_ids:
@@ -239,7 +300,51 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 20_000.
     )
 
     # ------------------------------------------------------------------
-    # 4. Stats loop
+    # 4. Market refresh thread — discovers new series windows + any new
+    #    standard markets that come online after startup.
+    # ------------------------------------------------------------------
+    _refresh_stop = threading.Event()
+
+    def _refresh_markets():
+        """Periodically re-scan Gamma for new markets and subscribe to them."""
+        while not _refresh_stop.wait(timeout=refresh_interval):
+            try:
+                new_standard = fetch_active_markets(all_pages=True, min_volume=min_volume)
+                new_series   = fetch_series_markets()
+                new_all      = new_standard + new_series
+                new_tok, new_side, new_q = build_token_maps(new_all)
+                added = 0
+                for tid, cid in new_tok.items():
+                    if tid not in token_to_condition:
+                        token_to_condition[tid] = cid
+                        token_to_side[tid]      = new_side[tid]
+                        feed.add_token(tid)
+                        added += 1
+                for cid, q in new_q.items():
+                    if cid not in condition_to_question:
+                        condition_to_question[cid] = q
+                if added:
+                    logger.info(
+                        "Market refresh: +%d new tokens subscribed "
+                        "(%d standard + %d series total)",
+                        added, len(new_standard), len(new_series),
+                    )
+                else:
+                    logger.debug(
+                        "Market refresh: no new tokens "
+                        "(%d standard + %d series scanned)",
+                        len(new_standard), len(new_series),
+                    )
+            except Exception as exc:
+                logger.warning("Market refresh error: %s", exc)
+
+    refresh_thread = threading.Thread(target=_refresh_markets, daemon=True,
+                                      name="market-refresh")
+    refresh_thread.start()
+    logger.info("Market refresh thread started (interval=%ds)", refresh_interval)
+
+    # ------------------------------------------------------------------
+    # 5. Stats loop
     # ------------------------------------------------------------------
     start_time = time.time()
     last_stats = start_time
@@ -256,8 +361,9 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 20_000.
         feed.stop()
 
     # ------------------------------------------------------------------
-    # 5. Flush & final stats
+    # 6. Flush & final stats
     # ------------------------------------------------------------------
+    _refresh_stop.set()
     logger.info("Flushing buffers...")
     writer.flush_all()
     _print_stats(writer, condition_to_question, start_time, final=True)
@@ -324,13 +430,25 @@ def main():
     parser.add_argument(
         "--min-volume",
         type=float,
-        default=20_000.0,
+        default=5_000.0,
         metavar="USD",
-        help="Minimum 24h volume to collect a market (default: 20000)",
+        help="Minimum 24h volume to collect a standard market (default: 5000)",
+    )
+    parser.add_argument(
+        "--refresh-interval",
+        type=int,
+        default=300,
+        metavar="SECS",
+        help="Seconds between market re-scans to pick up new/rolling series windows (default: 300)",
     )
     args = parser.parse_args()
 
-    run_collector(out_dir=args.out, stats_interval=args.stats_interval, min_volume=args.min_volume)
+    run_collector(
+        out_dir=args.out,
+        stats_interval=args.stats_interval,
+        min_volume=args.min_volume,
+        refresh_interval=args.refresh_interval,
+    )
 
 
 if __name__ == "__main__":
