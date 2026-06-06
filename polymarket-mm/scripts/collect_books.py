@@ -185,11 +185,17 @@ def fetch_series_markets() -> list[dict]:
 
     Returns a flat list of Gamma market dicts, same shape as fetch_active_markets().
     """
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     results: list[dict] = []
     for slug in TRACKED_SERIES:
+        # end_date_min filters out expired markets that Polymarket never marks closed.
+        # Without it, series like btc-up-or-down-5m return December 2025 stale events.
+        # limit=30 covers BTC 5m which pre-creates ~12 windows (1 hour ahead).
         url = (
             f"https://gamma-api.polymarket.com/events"
-            f"?series_slug={slug}&active=true&closed=false&limit=10"
+            f"?series_slug={slug}&closed=false&end_date_min={today}&limit=30"
         )
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
