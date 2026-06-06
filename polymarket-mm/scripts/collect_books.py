@@ -53,15 +53,27 @@ logger = logging.getLogger(__name__)
 # markets roll in automatically — the refresh thread discovers them.
 # ---------------------------------------------------------------------------
 TRACKED_SERIES = [
+    # Rolling 5-minute price up/down — new window every 5 min
     "btc-up-or-down-5m",
+    "eth-up-or-down-5m",
+    "sol-up-or-down-5m",
+    "xrp-up-or-down-5m",
+    # Rolling 15-minute price up/down — new window every 15 min
+    "btc-up-or-down-15m",
+    "eth-up-or-down-15m",
+    "sol-up-or-down-15m",
+    "xrp-up-or-down-15m",
+    # Daily price up/down
     "btc-up-or-down-daily",
     "eth-up-or-down-daily",
+    # Sports
     "mlb",
+    "ufc",
+    # Weekly crypto strike markets
     "btc-multi-strikes-weekly",
     "ethereum-multi-strikes-weekly",
     "xrp-multi-strikes-weekly",
     "solana-multi-strikes-weekly",
-    "ufc",
 ]
 
 # ---------------------------------------------------------------------------
