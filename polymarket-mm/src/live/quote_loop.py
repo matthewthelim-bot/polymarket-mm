@@ -65,17 +65,39 @@ class QuoteLoopConfig:
     quote_size: float = 100.0
     time_to_resolution_hours: float = 720.0
 
-    # Ladder quoting
+    # Ladder quoting — anchored to best bid/ask (not FV)
     ladder_levels: int = 3
-    ladder_tick_spacing: float = 0.01    # price gap between consecutive levels
-    # Relative size at each level; L0 (closest to FV) is the reference.
+    ladder_offset_from_best: float = 0.030  # L0 sits this far below best bid / above best ask
+    ladder_tick_spacing: float = 0.010       # price gap between consecutive levels
+    # Relative size at each level; L0 (closest to market) is the reference.
     # Sizes = [quote_size * r for r in ladder_size_ratios].
     # Default: 100 / 200 / 300 contracts at L0 / L1 / L2.
     ladder_size_ratios: list = field(default_factory=lambda: [1.0, 2.0, 3.0])
 
     # Order management
-    price_tolerance: float = 0.005       # re-post if quote moved by more than this
+    price_tolerance: float = 0.010       # re-post only if quote drifted by more than this (1 tick)
     order_ttl_seconds: float = 300.0     # cancel and re-quote after this duration
+    min_reprice_interval: float = 30.0   # minimum seconds between reprices per slot (reduces API churn)
+
+    # Iceberg orders — hide total capacity from the market.
+    # When > 0, each ladder level posts only `iceberg_display_size` contracts
+    # visibly.  After a display-size fill, the hidden reserve is re-posted at
+    # the same price until the full level_size is consumed.
+    # 0 = disabled (full size shown — current behaviour).
+    # Typical value: 50–100 contracts.
+    iceberg_display_size: float = 0.0
+
+    # Notional exposure cap per direction.
+    # When cumulative long notional reaches this, pull bids but keep asks live to close longs.
+    # When short notional reaches this, pull asks but keep bids live to close shorts.
+    # Set to 0 to disable.
+    max_open_notional: float = 2000.0
+
+    # Portfolio-level context for cross-market caps.
+    # days_to_resolution: days until market resolves (used by PortfolioConstraints).
+    # event_key: groups sub-markets of the same parent event (use end_date_iso).
+    days_to_resolution: int = 9999
+    event_key: str = ""
 
     # Risk
     adverse_selection_threshold: float = 0.012
@@ -100,11 +122,17 @@ class _RestingOrder:
     token_id: str
     side: Side               # BUY = bid, SELL = ask
     price: float
-    size: float
+    size: float              # currently displayed size on the book
     placed_at: float         # time.monotonic()
     token_side: str          # "YES" or "NO"
     order_side: str          # "bid" or "ask"
     level: int = 0           # ladder level index (0 = closest to FV)
+    last_reprice_at: float = 0.0  # time.monotonic() of most recent cancel+replace
+    # Iceberg tracking: full hidden capacity at this price level.
+    # 0 means no iceberg (full size was displayed).
+    # After each display-size fill, remaining_hidden is decremented and a new
+    # display order is re-posted until remaining_hidden drops to zero.
+    remaining_hidden: float = 0.0
 
 
 @dataclass
@@ -151,10 +179,12 @@ class QuoteLoop:
         config: QuoteLoopConfig,
         clob_client: ClobClient,
         fee_model: Optional[FeeModel] = None,
+        portfolio=None,   # Optional[PortfolioConstraints] — avoids circular import
     ):
         self.config = config
         self._client = clob_client
         self._fm = fee_model or FeeModel()
+        self._portfolio = portfolio  # shared cross-market constraints (may be None)
 
         # Strategy components
         self._fv_estimator = FairValueEstimator(twap_window_seconds=14400, external_weight=0.0)
@@ -200,6 +230,14 @@ class QuoteLoop:
 
         # Fills where the taker hedge hasn't been sent yet
         self._open_positions: list[_OpenPosition] = []
+
+        # Notional exposure tracking per direction.
+        # Incremented on each completed bid-arb (long) or ask-arb (short) cycle.
+        # Decremented when the opposing direction closes the position.
+        # Bids are suppressed when _long_notional >= max_open_notional;
+        # asks are suppressed when _short_notional >= max_open_notional.
+        self._long_notional: float = 0.0
+        self._short_notional: float = 0.0
 
         self._as_estimate: float = 0.0
         self._last_fv: Optional[float] = None
@@ -262,20 +300,33 @@ class QuoteLoop:
 
         if order_key.startswith("yes_bid_"):
             level = int(order_key.rsplit("_", 1)[1])
+            filled_order = self._yes_bids[level]
             self._yes_bids[level] = None
             self._handle_yes_bid_fill(fill.price, fill.size)
+            # Iceberg: re-post next slice at same price if hidden reserve remains
+            if filled_order and filled_order.remaining_hidden > 0.5:
+                self._repost_iceberg_slice(self._yes_bids, level, filled_order)
         elif order_key.startswith("yes_ask_"):
             level = int(order_key.rsplit("_", 1)[1])
+            filled_order = self._yes_asks[level]
             self._yes_asks[level] = None
             self._handle_yes_ask_fill(fill.price, fill.size)
+            if filled_order and filled_order.remaining_hidden > 0.5:
+                self._repost_iceberg_slice(self._yes_asks, level, filled_order)
         elif order_key.startswith("no_bid_"):
             level = int(order_key.rsplit("_", 1)[1])
+            filled_order = self._no_bids[level]
             self._no_bids[level] = None
             self._handle_no_bid_fill(fill.price, fill.size)
+            if filled_order and filled_order.remaining_hidden > 0.5:
+                self._repost_iceberg_slice(self._no_bids, level, filled_order)
         elif order_key.startswith("no_ask_"):
             level = int(order_key.rsplit("_", 1)[1])
+            filled_order = self._no_asks[level]
             self._no_asks[level] = None
             self._handle_no_ask_fill(fill.price, fill.size)
+            if filled_order and filled_order.remaining_hidden > 0.5:
+                self._repost_iceberg_slice(self._no_asks, level, filled_order)
         else:
             logger.warning(
                 "[%s] Could not route fill (token_side=%s price=%.3f) — recording as open",
@@ -592,7 +643,7 @@ class QuoteLoop:
         if self._current_yes_book is None or self._current_no_book is None:
             return
 
-        # Pause new quotes if too many unhedged positions
+        # Pause new quotes if too many unhedged taker-hedge positions
         if len(self._open_positions) >= self.config.max_open_positions:
             logger.warning(
                 "[%s] Open positions at limit (%d) — pausing new quotes",
@@ -613,20 +664,67 @@ class QuoteLoop:
 
         self.stats.quotes_computed += 1
 
-        # --- Base prices (L0, closest to FV) ---
-        # We deliberately quote BEHIND the top of book — only large price sweeps
-        # reach our orders, ensuring the gross arb is sufficient to cover the
-        # 7% taker fee on the opposing leg's notional.
-        yes_bid_base = decision.bid_price
-        yes_ask_base = decision.ask_price
-        no_fv = 1.0 - fv
-        fee_cost_no = self._fm.fee_flatten_expected(no_fv, self.config.fee_rate)
-        no_half_spread = max(
-            self._quote_engine.half_spread_base,
-            fee_cost_no + self._quote_engine.min_edge_floor,
-        )
-        no_bid_base = round(max(0.01, min(0.99, no_fv - no_half_spread)), 2)
-        no_ask_base = round(max(0.01, min(0.99, no_fv + no_half_spread)), 2)
+        # --- Notional cap: determine which sides are open for quoting ---
+        # Per-market cap: when long notional hits max_open_notional, suppress bids.
+        # Portfolio cap: when the shared PortfolioConstraints object says no more
+        # long-term or per-event exposure, also suppress the relevant side.
+        # The per-market long/short caps are mutually exclusive by construction.
+        cap = self.config.max_open_notional
+        long_capped  = cap > 0 and self._long_notional  >= cap
+        short_capped = cap > 0 and self._short_notional >= cap
+
+        # Portfolio-level cap: probe with a minimal notional to see if any new open
+        # would be rejected (use a small probe rather than actual quote notional to
+        # avoid false negatives on large size orders).
+        if not long_capped and self._portfolio is not None:
+            probe = 0.01  # 1 cent probe — if even this is blocked, we're at cap
+            long_capped = long_capped or not self._portfolio.can_open(
+                self.config.event_key, self.config.market_id,
+                probe, self.config.days_to_resolution
+            )
+        if not short_capped and self._portfolio is not None:
+            probe = 0.01
+            short_capped = short_capped or not self._portfolio.can_open(
+                self.config.event_key, self.config.market_id,
+                probe, self.config.days_to_resolution
+            )
+
+        if long_capped:
+            logger.info(
+                "[%s] Long cap hit (market=$%.0f/$%.0f, portfolio) — suppressing bids",
+                self.config.market_id, self._long_notional, cap,
+            )
+        if short_capped:
+            logger.info(
+                "[%s] Short cap hit (market=$%.0f/$%.0f, portfolio) — suppressing asks",
+                self.config.market_id, self._short_notional, cap,
+            )
+
+        # --- Base prices (L0) — anchored to current best bid/ask ---
+        # Each ladder level sits `ladder_offset_from_best` + n * tick below the
+        # best bid (for bids) or above the best ask (for asks).  The offset is
+        # chosen so L0 is still far enough from mid to cover the 7% taker fee on
+        # the opposing leg (default 0.030 >= fee cost + edge floor).
+        yes_best_bid = self._current_yes_book.best_bid()
+        yes_best_ask = self._current_yes_book.best_ask()
+        no_best_bid  = self._current_no_book.best_bid()
+        no_best_ask  = self._current_no_book.best_ask()
+
+        offset = self.config.ladder_offset_from_best
+        fv_fallback = 1.0 - fv  # used only when NO book has no depth
+
+        yes_bid_base = round(max(0.01, min(0.99,
+            (yes_best_bid - offset) if yes_best_bid is not None else decision.bid_price
+        )), 2)
+        yes_ask_base = round(max(0.01, min(0.99,
+            (yes_best_ask + offset) if yes_best_ask is not None else decision.ask_price
+        )), 2)
+        no_bid_base = round(max(0.01, min(0.99,
+            (no_best_bid - offset) if no_best_bid is not None else fv_fallback - offset
+        )), 2)
+        no_ask_base = round(max(0.01, min(0.99,
+            (no_best_ask + offset) if no_best_ask is not None else fv_fallback + offset
+        )), 2)
 
         # --- Build ladder prices ---
         # Each successive level moves one tick_spacing further from FV.
@@ -645,25 +743,43 @@ class QuoteLoop:
             ratios.append(ratios[-1])
         sizes = [decision.bid_size * ratios[i] for i in range(n)]
 
-        # --- Maintain all ladder levels ---
+        # --- Maintain all ladder levels (asymmetric when capped) ---
         now = time.monotonic()
         for i in range(n):
-            self._yes_bids[i] = self._maintain_order(
-                self._yes_bids[i], self.config.yes_token_id, Side.BUY,
-                yes_bid_prices[i], sizes[i], f"yes_bid_{i}", now,
-            )
-            self._yes_asks[i] = self._maintain_order(
-                self._yes_asks[i], self.config.yes_token_id, Side.SELL,
-                yes_ask_prices[i], sizes[i], f"yes_ask_{i}", now,
-            )
-            self._no_bids[i] = self._maintain_order(
-                self._no_bids[i], self.config.no_token_id, Side.BUY,
-                no_bid_prices[i], sizes[i], f"no_bid_{i}", now,
-            )
-            self._no_asks[i] = self._maintain_order(
-                self._no_asks[i], self.config.no_token_id, Side.SELL,
-                no_ask_prices[i], sizes[i], f"no_ask_{i}", now,
-            )
+            # Bids open longs → cancel if long-capped, otherwise maintain
+            if long_capped:
+                self._cancel_resting(self._yes_bids[i], label=f"yes_bid_{i}_cap")
+                self._yes_bids[i] = None
+            else:
+                self._yes_bids[i] = self._maintain_order(
+                    self._yes_bids[i], self.config.yes_token_id, Side.BUY,
+                    yes_bid_prices[i], sizes[i], f"yes_bid_{i}", now,
+                )
+            # Asks open shorts → cancel if short-capped, otherwise maintain
+            if short_capped:
+                self._cancel_resting(self._yes_asks[i], label=f"yes_ask_{i}_cap")
+                self._yes_asks[i] = None
+            else:
+                self._yes_asks[i] = self._maintain_order(
+                    self._yes_asks[i], self.config.yes_token_id, Side.SELL,
+                    yes_ask_prices[i], sizes[i], f"yes_ask_{i}", now,
+                )
+            if long_capped:
+                self._cancel_resting(self._no_bids[i], label=f"no_bid_{i}_cap")
+                self._no_bids[i] = None
+            else:
+                self._no_bids[i] = self._maintain_order(
+                    self._no_bids[i], self.config.no_token_id, Side.BUY,
+                    no_bid_prices[i], sizes[i], f"no_bid_{i}", now,
+                )
+            if short_capped:
+                self._cancel_resting(self._no_asks[i], label=f"no_ask_{i}_cap")
+                self._no_asks[i] = None
+            else:
+                self._no_asks[i] = self._maintain_order(
+                    self._no_asks[i], self.config.no_token_id, Side.SELL,
+                    no_ask_prices[i], sizes[i], f"no_ask_{i}", now,
+                )
 
     def _maintain_order(
         self,
@@ -682,12 +798,30 @@ class QuoteLoop:
         if current is not None:
             age = now - current.placed_at
             price_drift = abs(current.price - target_price)
+
+            # Still within tolerance — definitely keep it
             if price_drift <= self.config.price_tolerance and age <= self.config.order_ttl_seconds:
-                return current  # still valid, leave it
-            # Stale — cancel and replace
+                return current
+
+            # Drifted or TTL expired, but repriced too recently — absorb the churn
+            # (protects queue position and keeps API call rate manageable)
+            since_last_reprice = now - current.last_reprice_at
+            if since_last_reprice < self.config.min_reprice_interval:
+                return current
+
+            # Genuinely stale — cancel and replace
             self._cancel_resting(current, label=slot)
 
-        resp = self._place_order(token_id, side, target_price, size, slot)
+        # Iceberg: only show `iceberg_display_size` contracts; track full reserve.
+        display = self.config.iceberg_display_size
+        if display > 0 and size > display:
+            display_size   = display
+            hidden_reserve = size - display   # remaining to re-post after fills
+        else:
+            display_size   = size
+            hidden_reserve = 0.0
+
+        resp = self._place_order(token_id, side, target_price, display_size, slot)
         if resp is not None:
             # Extract level from slot name e.g. "yes_bid_2" → 2
             try:
@@ -699,11 +833,13 @@ class QuoteLoop:
                 token_id=token_id,
                 side=side,
                 price=target_price,
-                size=size,
+                size=display_size,
                 placed_at=now,
                 token_side="YES" if token_id == self.config.yes_token_id else "NO",
                 order_side="bid" if side == Side.BUY else "ask",
                 level=level,
+                last_reprice_at=now,
+                remaining_hidden=hidden_reserve,
             )
         return None
 
@@ -748,6 +884,55 @@ class QuoteLoop:
             )
             self.stats.errors += 1
             return None
+
+    def _repost_iceberg_slice(
+        self,
+        ladder: list[Optional[_RestingOrder]],
+        level: int,
+        filled_order: _RestingOrder,
+    ) -> None:
+        """
+        After a display-size iceberg fill, re-post the next slice at the same
+        price if there is remaining hidden inventory.
+
+        This is called immediately after a fill handler determines the filled order
+        was an iceberg order (remaining_hidden > 0).  The new slice is placed at
+        the same price; its own remaining_hidden is decremented accordingly.
+        """
+        display = self.config.iceberg_display_size
+        if display <= 0 or filled_order.remaining_hidden <= 0.5:
+            return
+
+        next_size   = min(display, filled_order.remaining_hidden)
+        next_hidden = filled_order.remaining_hidden - next_size
+
+        slot = f"{'yes' if filled_order.token_id == self.config.yes_token_id else 'no'}" \
+               f"_{'bid' if filled_order.side == Side.BUY else 'ask'}_{level}"
+
+        resp = self._place_order(
+            filled_order.token_id, filled_order.side,
+            filled_order.price, next_size, slot,
+        )
+        if resp is not None:
+            now = time.monotonic()
+            ladder[level] = _RestingOrder(
+                order_id=resp.order_id,
+                token_id=filled_order.token_id,
+                side=filled_order.side,
+                price=filled_order.price,
+                size=next_size,
+                placed_at=now,
+                token_side=filled_order.token_side,
+                order_side=filled_order.order_side,
+                level=level,
+                last_reprice_at=now,
+                remaining_hidden=next_hidden,
+            )
+            logger.info(
+                "[%s] ICEBERG re-post L%d: %s @ %.3f x %.1f  (hidden_remaining=%.0f)",
+                self.config.market_id, level,
+                filled_order.order_side.upper(), filled_order.price, next_size, next_hidden,
+            )
 
     def _cancel_resting(self, order: Optional[_RestingOrder], label: str = "") -> bool:
         """
@@ -898,16 +1083,62 @@ class QuoteLoop:
             size=size, price=taker_price,
             fee_rate=self.config.fee_rate,
         )
+        notional = (maker_price + taker_price) * size
         if fill_type in ("yes_bid", "no_bid"):
             gross = (1.0 - maker_price - taker_price) * size
+            # Bid-arb opens a long — check portfolio caps before recording.
+            if self._portfolio is not None and not self._portfolio.can_open(
+                self.config.event_key, self.config.market_id,
+                notional, self.config.days_to_resolution
+            ):
+                logger.info(
+                    "[%s] CYCLE %s BLOCKED by portfolio cap",
+                    self.config.market_id, fill_type,
+                )
+                # Don't track the position — treat as if fill was skipped.
+                return
+            self._long_notional += notional
+            if self._portfolio is not None:
+                self._portfolio.open_position(
+                    self.config.event_key, self.config.market_id,
+                    notional, self.config.days_to_resolution
+                )
         else:  # yes_ask, no_ask
             gross = (maker_price + taker_price - 1.0) * size
+            if self._long_notional > 0:
+                # Ask-arb closes an existing long — decrement long notional
+                self._long_notional -= notional
+                self._long_notional = max(0.0, self._long_notional)
+                if self._portfolio is not None:
+                    self._portfolio.close_position(
+                        self.config.event_key, self.config.market_id,
+                        notional, self.config.days_to_resolution
+                    )
+            else:
+                # No longs to close — opening a new short
+                if self._portfolio is not None and not self._portfolio.can_open(
+                    self.config.event_key, self.config.market_id,
+                    notional, self.config.days_to_resolution
+                ):
+                    logger.info(
+                        "[%s] CYCLE %s BLOCKED by portfolio cap",
+                        self.config.market_id, fill_type,
+                    )
+                    return
+                self._short_notional += notional
+                if self._portfolio is not None:
+                    self._portfolio.open_position(
+                        self.config.event_key, self.config.market_id,
+                        notional, self.config.days_to_resolution
+                    )
         net = gross + maker_rebate - taker_fee
         self.stats.total_pnl += net
         logger.info(
-            "[%s] CYCLE %s: maker=%.3f taker=%.3f size=%.1f gross=%.4f net=%.4f",
+            "[%s] CYCLE %s: maker=%.3f taker=%.3f size=%.1f gross=%.4f net=%.4f  "
+            "long_notional=%.0f short_notional=%.0f",
             self.config.market_id, fill_type,
             maker_price, taker_price, size, gross, net,
+            self._long_notional, self._short_notional,
         )
 
     def _record_maker_maker_cycle(self, label: str, price_a: float) -> None:
