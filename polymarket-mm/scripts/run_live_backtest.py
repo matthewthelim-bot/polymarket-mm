@@ -214,9 +214,15 @@ def compute_avg_trade_size(events) -> float:
 
 
 def adaptive_quote_size(avg_trade_size: float) -> float:
-    """Derive quote_size so L1 (ratio 2x) matches the market's avg trade size.
+    """Derive base quote_size for the ladder from the market's average trade size.
 
-    L0 = avg/2,  L1 = avg,  L2 = 1.5x avg  (with 1:2:3 ratios and base=avg/2)
+    With 5-level ratios [1.0, 1.5, 2.0, 2.5, 3.0] and base = avg_trade / 2:
+      L0 = 0.5x avg  (small near-market slice, fills on retail trades)
+      L1 = 0.75x avg
+      L2 = 1.0x avg  (matches typical full trade — anchor level)
+      L3 = 1.25x avg
+      L4 = 1.5x avg  (large deep order, fills only on big sweeps)
+
     Clamped to [5, 500] contracts — upper bound set high enough that liquid
     markets (avg trade 200–1000+) are not artificially capped.
     """
@@ -527,6 +533,25 @@ def main():
     print(f"  Maker rebates       ${total_rebates:+.2f}")
     print(f"  Taker fees          $-{total_fees:.2f}")
     print(f"  Win rate            {win_rate:.1f}%")
+
+    # Per-level fill breakdown — aggregate fills_by_level across all markets
+    max_level = max(
+        (len(r.fills_by_level) for _, r, _, _ in results if r.fills_by_level),
+        default=0
+    )
+    if max_level > 0:
+        level_totals = [0] * max_level
+        for _, r, _, _ in results:
+            for lvl, cnt in enumerate(r.fills_by_level):
+                level_totals[lvl] += cnt
+        total_level_fills = sum(level_totals)
+        print(f"\n  FILLS BY LADDER LEVEL  (offset={LADDER_OFFSET:.3f} + n×{LADDER_TICK:.3f})")
+        for lvl, cnt in enumerate(level_totals):
+            offset = LADDER_OFFSET + lvl * LADDER_TICK
+            ratio  = LADDER_SIZE_RATIOS[lvl] if lvl < len(LADDER_SIZE_RATIOS) else LADDER_SIZE_RATIOS[-1]
+            pct    = cnt / total_level_fills * 100 if total_level_fills else 0
+            bar    = "#" * int(pct / 5)
+            print(f"  L{lvl}  -{offset:.3f}  {ratio:.1f}x base   {cnt:>4} fills  {pct:>5.1f}%  {bar}")
 
     if all_hold_times:
         avg_hold = statistics.mean(all_hold_times)

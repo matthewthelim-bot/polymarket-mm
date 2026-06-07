@@ -143,6 +143,7 @@ class SimulationResult:
     num_bid_arb_cycles: int = 0            # completed bid-side arb cycles
     num_ask_arb_cycles: int = 0            # completed ask-side arb cycles
     num_portfolio_blocked: int = 0         # arb opens skipped due to portfolio caps
+    fills_by_level: list = field(default_factory=list)  # fill count per ladder level (index = level)
 
     # Round-trip position tracking
     num_longs_opened: int = 0              # bid-arb entries
@@ -262,6 +263,12 @@ class BacktestSimulator:
             adverse_threshold=config.adverse_selection_adverse_threshold,
         )
         self._result: SimulationResult = SimulationResult()
+
+    def _record_level_fill(self, level: int) -> None:
+        """Increment per-level fill counter, growing the list on demand."""
+        while len(self._result.fills_by_level) <= level:
+            self._result.fills_by_level.append(0)
+        self._result.fills_by_level[level] += 1
 
     def _update_anchor(
         self, anchor: float | None, current: float, tolerance: float
@@ -558,6 +565,7 @@ class BacktestSimulator:
 
                 self._result.hedge_accessible_count += 1
                 self._result.num_fills += 1
+                self._record_level_fill(level)
                 self._record_bid_arb_cycle(
                     maker_price=yes_bid,
                     taker_price=no_ask,
@@ -635,6 +643,7 @@ class BacktestSimulator:
                     break
 
                 self._result.num_fills += 1
+                self._record_level_fill(level)
                 self._record_ask_arb_cycle(
                     maker_price=yes_ask,
                     taker_price=no_bid,
@@ -720,6 +729,7 @@ class BacktestSimulator:
 
                 self._result.hedge_accessible_count += 1
                 self._result.num_fills += 1
+                self._record_level_fill(level)
                 self._record_bid_arb_cycle(
                     maker_price=no_bid,
                     taker_price=yes_ask,
@@ -795,6 +805,7 @@ class BacktestSimulator:
                     break
 
                 self._result.num_fills += 1
+                self._record_level_fill(level)
                 self._record_ask_arb_cycle(
                     maker_price=no_ask,
                     taker_price=yes_bid,
