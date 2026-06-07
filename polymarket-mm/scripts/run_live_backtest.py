@@ -44,15 +44,18 @@ REBATE_FRAC = 0.50
 QUOTE_SIZE  = 100.0
 LATENCY_MS  = 50
 
-# Ladder: 3 levels anchored to best bid/ask, increasing size deeper
-LADDER_LEVELS       = 3
+# Ladder: levels anchored to best bid/ask, ascending size going deeper.
+# Re-post on fill is handled automatically by _run_cycle() in the live loop.
+# More levels = more depth coverage when a single large trade sweeps.
+LADDER_LEVELS       = 5
 LADDER_OFFSET       = 0.030   # L0 sits this far below best bid / above best ask
 LADDER_TICK         = 0.010   # each successive level goes one tick deeper
-LADDER_SIZE_RATIOS  = [1.0, 2.0, 3.0]   # 100 / 200 / 300 contracts
+LADDER_SIZE_RATIOS  = [1.0, 1.5, 2.0, 2.5, 3.0]   # ascending: small near market → large deep
 
-# Iceberg orders — set to 0 to disable, or e.g. 50 to show only 50 contracts
-# per slice and sweep through the hidden reserve on each large market trade.
-ICEBERG_DISPLAY_SIZE = 50.0   # contracts per visible slice (0 = no iceberg)
+# Iceberg within-level slicing — 0 = disabled (realistic).
+# A market IOC order sweeps our level once and moves on; the live re-post
+# happens via _run_cycle() on the NEXT trade, not within the same event.
+ICEBERG_DISPLAY_SIZE = 0.0    # 0 = off; set >0 only for sensitivity analysis
 
 # Order management — must match live QuoteLoopConfig defaults so the backtest
 # faithfully models what will happen in production.

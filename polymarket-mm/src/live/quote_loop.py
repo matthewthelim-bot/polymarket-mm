@@ -65,14 +65,15 @@ class QuoteLoopConfig:
     quote_size: float = 100.0
     time_to_resolution_hours: float = 720.0
 
-    # Ladder quoting — anchored to best bid/ask (not FV)
-    ladder_levels: int = 3
+    # Ladder quoting — anchored to best bid/ask, ascending size going deeper.
+    # Re-post on fill happens automatically: every on_fill() calls _run_cycle()
+    # which immediately re-posts any empty slot at the current market price.
+    ladder_levels: int = 5
     ladder_offset_from_best: float = 0.030  # L0 sits this far below best bid / above best ask
     ladder_tick_spacing: float = 0.010       # price gap between consecutive levels
-    # Relative size at each level; L0 (closest to market) is the reference.
-    # Sizes = [quote_size * r for r in ladder_size_ratios].
-    # Default: 100 / 200 / 300 contracts at L0 / L1 / L2.
-    ladder_size_ratios: list = field(default_factory=lambda: [1.0, 2.0, 3.0])
+    # Sizes ascend with depth: small near market (less capital at risk, fills more easily),
+    # large deep (absorbs big sweeps). Multiplied by quote_size.
+    ladder_size_ratios: list = field(default_factory=lambda: [1.0, 1.5, 2.0, 2.5, 3.0])
 
     # Order management
     price_tolerance: float = 0.010       # re-post only if quote drifted by more than this (1 tick)
