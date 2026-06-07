@@ -302,7 +302,14 @@ def main():
     parser = argparse.ArgumentParser(description="Run backtest against EC2 collector data")
     parser.add_argument("--no-sync", action="store_true",
                         help="Skip EC2 sync and use whatever is in data/live already")
+    parser.add_argument("--capital", type=float, default=None,
+                        help="Override TOTAL_CAPITAL (default: use script constant)")
     args = parser.parse_args()
+
+    # Allow CLI override of capital
+    global TOTAL_CAPITAL
+    if args.capital is not None:
+        TOTAL_CAPITAL = args.capital
 
     if not args.no_sync:
         sync_from_ec2()
@@ -443,10 +450,6 @@ def main():
     total_positions = total_longs + total_shorts
     recycled_pct    = (total_roundtrips / total_positions * 100) if total_positions else 0
     avg_notional    = (total_capital / total_positions) if total_positions else 0
-    # Peak capital = peak concurrent positions × actual avg notional per position.
-    # (Not QUOTE_SIZE × ladder_ratios, which would be max-possible, not actual.)
-    peak_locked     = peak_concurrent * avg_notional
-    roc             = (total_pnl / peak_locked * 100) if peak_locked else 0
 
     # Net open positions at end of window (still locked awaiting resolution)
     # bid-arbs that opened longs minus ask-arbs that closed longs
@@ -456,6 +459,12 @@ def main():
     net_shorts_open = total_shorts - longs_closed_by_arb
     net_open        = net_longs_open + net_shorts_open
     capital_at_resolution = net_open * avg_notional
+
+    # Return on capital uses capital actually locked at end of run (most meaningful for
+    # a position-accumulating strategy where capital builds up until resolution).
+    # The old "peak_concurrent × avg_notional" was a per-market metric (misleading).
+    lt_budget       = TOTAL_CAPITAL * MAX_LONG_TERM_FRACTION  # the portfolio cap ceiling
+    roc             = (total_pnl / capital_at_resolution * 100) if capital_at_resolution else 0
 
     # Sharpe ratio (annualised, cycle-frequency method, no risk-free rate)
     #
@@ -500,12 +509,14 @@ def main():
     print(f"  Avg notional        ${avg_notional:>8,.2f}  per position (both legs)")
     print(f"  Recycling           {recycled_pct:>5.1f}%  "
           f"({total_roundtrips} closed within window / {total_positions} opened)")
-    print(f"  Peak capital locked ${peak_locked:>8,.0f}  USDC  "
-          f"({peak_concurrent} concurrent positions × ${avg_notional:.2f})")
+    print(f"  Capital at end      ${capital_at_resolution:>8,.0f}  USDC locked in {net_open} open positions")
+    print(f"  LT cap budget       ${lt_budget:>8,.0f}  USDC  "
+          f"({MAX_LONG_TERM_FRACTION*100:.0f}% of ${TOTAL_CAPITAL:,.0f} wallet — "
+          f"${lt_budget - capital_at_resolution:,.0f} remaining)")
     print(f"  Net PnL             ${total_pnl:>+8.2f}  "
           f"(${total_pnl/period_days:.2f}/day  ~${total_pnl/period_days*365:,.0f}/yr)")
     print(f"  Return on capital   {roc:>+7.2f}%  over {period_days:.1f} days  "
-          f"(~{roc/period_days*365:.0f}% ann.)")
+          f"(~{roc/period_days*365:.0f}% ann.)  [vs ${capital_at_resolution:,.0f} locked]")
     if not math.isnan(sharpe_ann):
         print(f"  Sharpe (ann.)       {sharpe_ann:>7.2f}")
     print("=" * 55)
