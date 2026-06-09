@@ -49,10 +49,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Top series to track (slug → human label).  New 5-min / daily / weekly
-# markets roll in automatically — the refresh thread discovers them.
+# Top series to track, split by activity rate.
+#
+# HIGH_FREQ_SERIES: 5-min and 15-min windows — very active per-second,
+#   fill the WS throttle quota quickly. Keep on a dedicated connection.
+#
+# LOW_FREQ_SERIES: daily, weekly, and sports — lower per-second activity,
+#   need their own dedicated WS connection so they aren't crowded out by
+#   the high-frequency windows.
+#
+# The Polymarket WS throttles to ~50 active markets per connection.
+# Splitting into separate feeds ensures each group gets its fair share.
 # ---------------------------------------------------------------------------
-TRACKED_SERIES = [
+HIGH_FREQ_SERIES = [
     # Rolling 5-minute price up/down — new window every 5 min
     "btc-up-or-down-5m",
     "eth-up-or-down-5m",
@@ -63,6 +72,9 @@ TRACKED_SERIES = [
     "eth-up-or-down-15m",
     "sol-up-or-down-15m",
     "xrp-up-or-down-15m",
+]
+
+LOW_FREQ_SERIES = [
     # Daily price up/down
     "btc-up-or-down-daily",
     "eth-up-or-down-daily",
@@ -75,6 +87,9 @@ TRACKED_SERIES = [
     "xrp-multi-strikes-weekly",
     "solana-multi-strikes-weekly",
 ]
+
+# Combined list for backwards-compat (used by fetch_series_markets)
+TRACKED_SERIES = HIGH_FREQ_SERIES + LOW_FREQ_SERIES
 
 # ---------------------------------------------------------------------------
 # Buffered file writer
@@ -187,21 +202,26 @@ def build_token_maps(
     return token_to_condition, token_to_side, condition_to_question
 
 
-def fetch_series_markets() -> list[dict]:
-    """Fetch currently active markets from all TRACKED_SERIES.
+def fetch_series_markets(slugs: list[str] | None = None) -> list[dict]:
+    """Fetch currently active markets from tracked series.
 
     Series markets (BTC 5-min, ETH daily, MLB game lines, etc.) rotate on a
     fixed schedule and never appear in the standard /markets volume scan because
     each individual window is short-lived.  We discover them by querying each
     series directly for its active events.
 
+    Args:
+        slugs: List of series slugs to fetch. Defaults to TRACKED_SERIES (all).
+
     Returns a flat list of Gamma market dicts, same shape as fetch_active_markets().
     """
     from datetime import datetime, timezone
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if slugs is None:
+        slugs = TRACKED_SERIES
 
     results: list[dict] = []
-    for slug in TRACKED_SERIES:
+    for slug in slugs:
         # end_date_min filters out expired markets that Polymarket never marks closed.
         # Without it, series like btc-up-or-down-5m return December 2025 stale events.
         # limit=30 covers BTC 5m which pre-creates ~12 windows (1 hour ahead).
@@ -242,27 +262,47 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
     markets = fetch_active_markets(all_pages=True, min_volume=min_volume)
     logger.info("Fetched %d standard markets with 24h volume >= $%.0f", len(markets), min_volume)
 
-    series_markets = fetch_series_markets()
-    logger.info("Fetched %d series markets from %d tracked series", len(series_markets), len(TRACKED_SERIES))
-
-    all_markets = markets + series_markets
-
-    token_to_condition, token_to_side, condition_to_question = build_token_maps(all_markets)
-    all_token_ids = list(token_to_condition.keys())
+    hf_markets = fetch_series_markets(slugs=HIGH_FREQ_SERIES)
+    lf_markets = fetch_series_markets(slugs=LOW_FREQ_SERIES)
     logger.info(
-        "Built token map: %d tokens across %d markets (%d standard + %d series)",
-        len(all_token_ids),
-        len(condition_to_question),
-        len(markets),
-        len(series_markets),
+        "Fetched %d high-freq series (%d slugs) + %d low-freq series (%d slugs)",
+        len(hf_markets), len(HIGH_FREQ_SERIES),
+        len(lf_markets), len(LOW_FREQ_SERIES),
     )
 
-    if not all_token_ids:
+    # Build separate token maps so each feed gets its own WS connection.
+    # The Polymarket WS throttles to ~50 active markets per connection regardless
+    # of subscription size. Three dedicated connections prevent any group from
+    # starving the others:
+    #   - std_feed:  standard markets (6k+ tokens, top 50 by global volume)
+    #   - hf_feed:   5m/15m BTC/ETH/SOL/XRP  (very active per-second)
+    #   - lf_feed:   daily, weekly, MLB, UFC  (lower per-second, need their own slot)
+    std_tok_cond, std_tok_side, std_cond_q = build_token_maps(markets)
+    hf_tok_cond,  hf_tok_side,  hf_cond_q  = build_token_maps(hf_markets)
+    lf_tok_cond,  lf_tok_side,  lf_cond_q  = build_token_maps(lf_markets)
+
+    # Shared mutable maps (written by refresh thread, read by callbacks)
+    token_to_condition: dict[str, str] = {**std_tok_cond, **hf_tok_cond, **lf_tok_cond}
+    token_to_side: dict[str, str]      = {**std_tok_side, **hf_tok_side, **lf_tok_side}
+    condition_to_question: dict[str, str] = {**std_cond_q, **hf_cond_q, **lf_cond_q}
+
+    std_token_ids = list(std_tok_cond.keys())
+    hf_token_ids  = list(hf_tok_cond.keys())
+    lf_token_ids  = list(lf_tok_cond.keys())
+
+    logger.info(
+        "Token maps: %d std (%d mkts) | %d hf-series (%d mkts) | %d lf-series (%d mkts)",
+        len(std_token_ids), len(markets),
+        len(hf_token_ids),  len(hf_markets),
+        len(lf_token_ids),  len(lf_markets),
+    )
+
+    if not any([std_token_ids, hf_token_ids, lf_token_ids]):
         logger.error("No token IDs found — cannot subscribe. Exiting.")
         sys.exit(1)
 
     # ------------------------------------------------------------------
-    # 2. Define callbacks
+    # 2. Define callbacks (shared by both feeds)
     # ------------------------------------------------------------------
 
     def on_book_update(token_id: str, book: OrderBook) -> None:
@@ -296,62 +336,93 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
         writer.write(condition_id, event)
 
     # ------------------------------------------------------------------
-    # 3. Start BookFeed
+    # 3. Start THREE BookFeeds — each group gets its own WS connection.
     # ------------------------------------------------------------------
-    feed = BookFeed(all_token_ids)
-    feed.on_any_book_update(on_book_update)
-    feed.on_any_trade(on_trade)
+    std_feed = BookFeed(std_token_ids) if std_token_ids else None
+    hf_feed  = BookFeed(hf_token_ids)  if hf_token_ids  else None
+    lf_feed  = BookFeed(lf_token_ids)  if lf_token_ids  else None
+
+    for feed in (std_feed, hf_feed, lf_feed):
+        if feed:
+            feed.on_any_book_update(on_book_update)
+            feed.on_any_trade(on_trade)
 
     # Graceful shutdown on Ctrl+C or SIGTERM
     def _shutdown(signum, frame):
-        logger.info("Shutdown signal received — stopping feed...")
-        feed.stop()
+        logger.info("Shutdown signal received — stopping feeds...")
+        for feed in (std_feed, hf_feed, lf_feed):
+            if feed:
+                feed.stop()
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    feed.start()
-    logger.info(
-        "BookFeed started. Subscribed to %d tokens. Writing to %s",
-        len(all_token_ids),
-        writer.get_dir(),
-    )
+    if std_feed:
+        std_feed.start()
+        logger.info("Standard feed started:    %d tokens", len(std_token_ids))
+    if hf_feed:
+        hf_feed.start()
+        logger.info("High-freq series feed:    %d tokens (5m/15m BTC/ETH/SOL/XRP)", len(hf_token_ids))
+    if lf_feed:
+        lf_feed.start()
+        logger.info("Low-freq series feed:     %d tokens (daily/weekly/MLB/UFC). Writing to %s",
+                    len(lf_token_ids), writer.get_dir())
 
     # ------------------------------------------------------------------
     # 4. Market refresh thread — discovers new series windows + any new
     #    standard markets that come online after startup.
+    #    New standard tokens go to std_feed; new series tokens to ser_feed.
     # ------------------------------------------------------------------
     _refresh_stop = threading.Event()
 
     def _refresh_markets():
-        """Periodically re-scan Gamma for new markets and subscribe to them."""
+        """Periodically re-scan Gamma for new markets and subscribe to the right feed."""
         while not _refresh_stop.wait(timeout=refresh_interval):
             try:
                 new_standard = fetch_active_markets(all_pages=True, min_volume=min_volume)
-                new_series   = fetch_series_markets()
-                new_all      = new_standard + new_series
-                new_tok, new_side, new_q = build_token_maps(new_all)
-                added = 0
-                for tid, cid in new_tok.items():
+                new_hf       = fetch_series_markets(slugs=HIGH_FREQ_SERIES)
+                new_lf       = fetch_series_markets(slugs=LOW_FREQ_SERIES)
+                new_std_tok, new_std_side, new_std_q = build_token_maps(new_standard)
+                new_hf_tok,  new_hf_side,  new_hf_q  = build_token_maps(new_hf)
+                new_lf_tok,  new_lf_side,  new_lf_q  = build_token_maps(new_lf)
+                added_std = added_hf = added_lf = 0
+                for tid, cid in new_std_tok.items():
                     if tid not in token_to_condition:
                         token_to_condition[tid] = cid
-                        token_to_side[tid]      = new_side[tid]
-                        feed.add_token(tid)
-                        added += 1
-                for cid, q in new_q.items():
+                        token_to_side[tid]      = new_std_side[tid]
+                        if std_feed:
+                            std_feed.add_token(tid)
+                        added_std += 1
+                for tid, cid in new_hf_tok.items():
+                    if tid not in token_to_condition:
+                        token_to_condition[tid] = cid
+                        token_to_side[tid]      = new_hf_side[tid]
+                        if hf_feed:
+                            hf_feed.add_token(tid)
+                        added_hf += 1
+                for tid, cid in new_lf_tok.items():
+                    if tid not in token_to_condition:
+                        token_to_condition[tid] = cid
+                        token_to_side[tid]      = new_lf_side[tid]
+                        if lf_feed:
+                            lf_feed.add_token(tid)
+                        added_lf += 1
+                for cid, q in {**new_std_q, **new_hf_q, **new_lf_q}.items():
                     if cid not in condition_to_question:
                         condition_to_question[cid] = q
+                added = added_std + added_hf + added_lf
                 if added:
                     logger.info(
-                        "Market refresh: +%d new tokens subscribed "
-                        "(%d standard + %d series total)",
-                        added, len(new_standard), len(new_series),
+                        "Market refresh: +%d new tokens (+%d std, +%d hf, +%d lf) — "
+                        "totals: %d std / %d hf / %d lf",
+                        added, added_std, added_hf, added_lf,
+                        len(new_standard), len(new_hf), len(new_lf),
                     )
                 else:
                     logger.debug(
                         "Market refresh: no new tokens "
-                        "(%d standard + %d series scanned)",
-                        len(new_standard), len(new_series),
+                        "(%d std + %d hf + %d lf scanned)",
+                        len(new_standard), len(new_hf), len(new_lf),
                     )
             except Exception as exc:
                 logger.warning("Market refresh error: %s", exc)
@@ -367,8 +438,11 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
     start_time = time.time()
     last_stats = start_time
 
+    def _any_feed_running() -> bool:
+        return any(f is not None and f.is_running() for f in (std_feed, hf_feed, lf_feed))
+
     try:
-        while feed.is_running():
+        while _any_feed_running():
             time.sleep(1.0)
             now = time.time()
             if now - last_stats >= stats_interval:
@@ -376,7 +450,9 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
                 _print_stats(writer, condition_to_question, start_time)
     except KeyboardInterrupt:
         # SIGINT already handled above, but just in case
-        feed.stop()
+        for feed in (std_feed, hf_feed, lf_feed):
+            if feed:
+                feed.stop()
 
     # ------------------------------------------------------------------
     # 6. Flush & final stats
