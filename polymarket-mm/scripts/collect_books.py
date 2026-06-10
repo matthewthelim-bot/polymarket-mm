@@ -49,47 +49,49 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Top series to track, split by activity rate.
+# Series feed groups — each group gets its OWN WebSocket connection.
 #
-# HIGH_FREQ_SERIES: 5-min and 15-min windows — very active per-second,
-#   fill the WS throttle quota quickly. Keep on a dedicated connection.
-#
-# LOW_FREQ_SERIES: daily, weekly, and sports — lower per-second activity,
-#   need their own dedicated WS connection so they aren't crowded out by
-#   the high-frequency windows.
-#
-# The Polymarket WS throttles to ~50 active markets per connection.
-# Splitting into separate feeds ensures each group gets its fair share.
+# The Polymarket WS pushes events for only ~WS_MARKETS_PER_CONNECTION active
+# markets per connection, so coverage scales with the number of connections.
+# Groups are sized so each stays comfortably under that cap; the per-feed
+# saturation gauge in the stats output (e.g. "ser-mlb: 50/~50 SATURATED")
+# tells you when a group needs to be split further.
 # ---------------------------------------------------------------------------
-HIGH_FREQ_SERIES = [
-    # Rolling 5-minute price up/down — new window every 5 min
-    "btc-up-or-down-5m",
-    "eth-up-or-down-5m",
-    "sol-up-or-down-5m",
-    "xrp-up-or-down-5m",
-    # Rolling 15-minute price up/down — new window every 15 min
-    "btc-up-or-down-15m",
-    "eth-up-or-down-15m",
-    "sol-up-or-down-15m",
-    "xrp-up-or-down-15m",
-]
+WS_MARKETS_PER_CONNECTION = 50      # empirical server-side throttle
+SATURATION_WARN_THRESHOLD = 45      # warn when a feed pins near the cap
 
-LOW_FREQ_SERIES = [
-    # Daily price up/down
-    "btc-up-or-down-daily",
-    "eth-up-or-down-daily",
-    # Sports
-    "mlb",
-    "ufc",
-    # Weekly crypto strike markets
-    "btc-multi-strikes-weekly",
-    "ethereum-multi-strikes-weekly",
-    "xrp-multi-strikes-weekly",
-    "solana-multi-strikes-weekly",
-]
+SERIES_FEED_GROUPS: dict[str, list[str]] = {
+    # Rolling 5-minute windows — new market every 5 min per asset
+    "ser-5m": [
+        "btc-up-or-down-5m",
+        "eth-up-or-down-5m",
+        "sol-up-or-down-5m",
+        "xrp-up-or-down-5m",
+    ],
+    # Rolling 15-minute windows
+    "ser-15m": [
+        "btc-up-or-down-15m",
+        "eth-up-or-down-15m",
+        "sol-up-or-down-15m",
+        "xrp-up-or-down-15m",
+    ],
+    # Daily up/down + weekly strike markets
+    "ser-dw": [
+        "btc-up-or-down-daily",
+        "eth-up-or-down-daily",
+        "btc-multi-strikes-weekly",
+        "ethereum-multi-strikes-weekly",
+        "xrp-multi-strikes-weekly",
+        "solana-multi-strikes-weekly",
+    ],
+    # Sports — each gets its own connection (MLB alone has ~16 betting
+    # lines per game x ~15 games/day = the whole cap by itself)
+    "ser-mlb": ["mlb"],
+    "ser-ufc": ["ufc"],
+}
 
-# Combined list for backwards-compat (used by fetch_series_markets)
-TRACKED_SERIES = HIGH_FREQ_SERIES + LOW_FREQ_SERIES
+# Flat list for backwards-compat (fetch_series_markets default)
+TRACKED_SERIES = [s for slugs in SERIES_FEED_GROUPS.values() for s in slugs]
 
 # ---------------------------------------------------------------------------
 # Buffered file writer
@@ -268,7 +270,7 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
     writer = BufferedMarketWriter(base_dir)
 
     # ------------------------------------------------------------------
-    # 1. Fetch active markets (standard + series)
+    # 1. Fetch active markets (standard + series), one labeled feed each.
     # ------------------------------------------------------------------
     logger.info(
         "Fetching active markets from Gamma API (min_volume=$%.0f) ...", min_volume
@@ -276,66 +278,63 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
     markets = fetch_active_markets(all_pages=True, min_volume=min_volume)
     logger.info("Fetched %d standard markets with 24h volume >= $%.0f", len(markets), min_volume)
 
-    hf_markets = fetch_series_markets(slugs=HIGH_FREQ_SERIES)
-    lf_markets = fetch_series_markets(slugs=LOW_FREQ_SERIES)
-    logger.info(
-        "Fetched %d high-freq series (%d slugs) + %d low-freq series (%d slugs)",
-        len(hf_markets), len(HIGH_FREQ_SERIES),
-        len(lf_markets), len(LOW_FREQ_SERIES),
-    )
+    # feed_tokens: label -> list of token_ids for that connection.
+    # Standard markets split into volume tiers (Gamma returns them sorted by
+    # volume24hr desc, so contiguous chunks = tiers; each shard captures its
+    # own ~top-50 instead of one global top-50). Each series group gets its
+    # own connection (see SERIES_FEED_GROUPS).
+    feed_tokens: dict[str, list[str]] = {}
+    token_to_condition: dict[str, str] = {}
+    token_to_side: dict[str, str] = {}
+    condition_to_question: dict[str, str] = {}
+    token_to_feed: dict[str, str] = {}   # for the per-feed saturation gauge
 
-    # Build separate token maps so each feed gets its own WS connection.
-    # The Polymarket WS pushes events for only ~50 active markets per
-    # connection regardless of subscription size, so coverage scales with the
-    # number of connections:
-    #   - std shards: standard markets split into volume tiers (Gamma returns
-    #     them sorted by volume24hr desc, so contiguous chunks = tiers; each
-    #     shard captures its own top-50 instead of one global top-50)
-    #   - hf_feed:    5m/15m BTC/ETH/SOL/XRP  (very active per-second)
-    #   - lf_feed:    daily, weekly, MLB, UFC  (lower per-second rate)
-    std_shards = max(1, std_shards)
-    shard_size = (len(markets) + std_shards - 1) // std_shards if markets else 0
-    std_shard_maps = []
-    for i in range(std_shards):
-        chunk = markets[i * shard_size:(i + 1) * shard_size]
-        if chunk:
-            std_shard_maps.append(build_token_maps(chunk))
-    hf_tok_cond, hf_tok_side, hf_cond_q = build_token_maps(hf_markets)
-    lf_tok_cond, lf_tok_side, lf_cond_q = build_token_maps(lf_markets)
-
-    # Shared mutable maps (written by refresh thread, read by callbacks)
-    token_to_condition: dict[str, str] = {**hf_tok_cond, **lf_tok_cond}
-    token_to_side: dict[str, str]      = {**hf_tok_side, **lf_tok_side}
-    condition_to_question: dict[str, str] = {**hf_cond_q, **lf_cond_q}
-    for tok_cond, tok_side, cond_q in std_shard_maps:
+    def _register(label: str, mkts: list[dict]) -> None:
+        tok_cond, tok_side, cond_q = build_token_maps(mkts)
+        feed_tokens[label] = list(tok_cond.keys())
         token_to_condition.update(tok_cond)
         token_to_side.update(tok_side)
         condition_to_question.update(cond_q)
+        for tid in tok_cond:
+            token_to_feed[tid] = label
 
-    std_shard_token_ids = [list(m[0].keys()) for m in std_shard_maps]
-    hf_token_ids = list(hf_tok_cond.keys())
-    lf_token_ids = list(lf_tok_cond.keys())
+    std_shards = max(1, std_shards)
+    shard_size = (len(markets) + std_shards - 1) // std_shards if markets else 0
+    std_labels = []
+    for i in range(std_shards):
+        chunk = markets[i * shard_size:(i + 1) * shard_size]
+        if chunk:
+            label = f"std-{i + 1}"
+            std_labels.append(label)
+            _register(label, chunk)
+
+    for label, slugs in SERIES_FEED_GROUPS.items():
+        group_markets = fetch_series_markets(slugs=slugs)
+        _register(label, group_markets)
 
     logger.info(
-        "Token maps: %s std tokens in %d shards (%d mkts) | %d hf-series (%d mkts) | %d lf-series (%d mkts)",
-        "+".join(str(len(t)) for t in std_shard_token_ids) or "0",
-        len(std_shard_token_ids), len(markets),
-        len(hf_token_ids), len(hf_markets),
-        len(lf_token_ids), len(lf_markets),
+        "Feeds: %s",
+        "  ".join(f"{lbl}={len(tids)}tok" for lbl, tids in feed_tokens.items()),
     )
 
-    if not any([std_shard_token_ids, hf_token_ids, lf_token_ids]):
+    if not any(feed_tokens.values()):
         logger.error("No token IDs found — cannot subscribe. Exiting.")
         sys.exit(1)
 
     # ------------------------------------------------------------------
-    # 2. Define callbacks (shared by both feeds)
+    # 2. Define callbacks (shared by all feeds)
     # ------------------------------------------------------------------
+    # Saturation gauge: distinct markets seen per feed in the current stats
+    # window. The WS server pushes events for only ~WS_MARKETS_PER_CONNECTION
+    # active markets per connection — a feed pinned at that count is
+    # saturated and silently dropping the rest of its subscription.
+    active_by_feed: dict[str, set] = defaultdict(set)
 
     def on_book_update(token_id: str, book: OrderBook) -> None:
         condition_id = token_to_condition.get(token_id)
         if not condition_id:
             return
+        active_by_feed[token_to_feed.get(token_id, "?")].add(condition_id)
         event = {
             "event_type": "book",
             "market_id": condition_id,
@@ -350,6 +349,7 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
         condition_id = token_to_condition.get(token_id)
         if not condition_id:
             return
+        active_by_feed[token_to_feed.get(token_id, "?")].add(condition_id)
         side = token_to_side.get(token_id, "unknown")
         event = {
             "event_type": "trade",
@@ -363,13 +363,14 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
         writer.write(condition_id, event)
 
     # ------------------------------------------------------------------
-    # 3. Start the BookFeeds — N standard shards + hf + lf, one WS each.
+    # 3. Start the BookFeeds — one WS connection per label.
     # ------------------------------------------------------------------
-    std_feeds = [BookFeed(tids) for tids in std_shard_token_ids if tids]
-    hf_feed = BookFeed(hf_token_ids) if hf_token_ids else None
-    lf_feed = BookFeed(lf_token_ids) if lf_token_ids else None
+    feeds: dict[str, BookFeed] = {
+        label: BookFeed(tids) for label, tids in feed_tokens.items() if tids
+    }
+    std_feeds = [feeds[lbl] for lbl in std_labels if lbl in feeds]
 
-    all_feeds = [f for f in (*std_feeds, hf_feed, lf_feed) if f is not None]
+    all_feeds = list(feeds.values())
     for feed in all_feeds:
         feed.on_any_book_update(on_book_update)
         feed.on_any_trade(on_trade)
@@ -383,76 +384,61 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    for i, feed in enumerate(std_feeds):
+    for label, feed in feeds.items():
         feed.start()
-        logger.info("Standard shard %d/%d started: %d tokens",
-                    i + 1, len(std_feeds), len(std_shard_token_ids[i]))
-    if hf_feed:
-        hf_feed.start()
-        logger.info("High-freq series feed:    %d tokens (5m/15m BTC/ETH/SOL/XRP)", len(hf_token_ids))
-    if lf_feed:
-        lf_feed.start()
-        logger.info("Low-freq series feed:     %d tokens (daily/weekly/MLB/UFC). Writing to %s",
-                    len(lf_token_ids), writer.get_dir())
+        logger.info("Feed %-8s started: %d tokens", label, len(feed_tokens[label]))
+    logger.info("Writing to %s", writer.get_dir())
 
     # ------------------------------------------------------------------
     # 4. Market refresh thread — discovers new series windows + any new
     #    standard markets that come online after startup.
     #    New standard tokens round-robin across std shards; series tokens
-    #    go to their dedicated feed.
+    #    go to their group's feed.
     # ------------------------------------------------------------------
     _refresh_stop = threading.Event()
     _next_shard = [0]  # round-robin cursor for new standard tokens
+
+    def _subscribe_new(label: str, tok_cond: dict, tok_side: dict) -> int:
+        """Register tokens not yet known and subscribe them on `label`'s feed."""
+        added = 0
+        for tid, cid in tok_cond.items():
+            if tid not in token_to_condition:
+                token_to_condition[tid] = cid
+                token_to_side[tid] = tok_side[tid]
+                if label == "std" and std_feeds:
+                    # round-robin across standard shards
+                    shard_idx = _next_shard[0] % len(std_feeds)
+                    std_feeds[shard_idx].add_token(tid)
+                    token_to_feed[tid] = std_labels[shard_idx]
+                    _next_shard[0] += 1
+                elif label in feeds:
+                    feeds[label].add_token(tid)
+                    token_to_feed[tid] = label
+                added += 1
+        return added
 
     def _refresh_markets():
         """Periodically re-scan Gamma for new markets and subscribe to the right feed."""
         while not _refresh_stop.wait(timeout=refresh_interval):
             try:
                 new_standard = fetch_active_markets(all_pages=True, min_volume=min_volume)
-                new_hf       = fetch_series_markets(slugs=HIGH_FREQ_SERIES)
-                new_lf       = fetch_series_markets(slugs=LOW_FREQ_SERIES)
-                new_std_tok, new_std_side, new_std_q = build_token_maps(new_standard)
-                new_hf_tok,  new_hf_side,  new_hf_q  = build_token_maps(new_hf)
-                new_lf_tok,  new_lf_side,  new_lf_q  = build_token_maps(new_lf)
-                added_std = added_hf = added_lf = 0
-                for tid, cid in new_std_tok.items():
-                    if tid not in token_to_condition:
-                        token_to_condition[tid] = cid
-                        token_to_side[tid]      = new_std_side[tid]
-                        if std_feeds:
-                            std_feeds[_next_shard[0] % len(std_feeds)].add_token(tid)
-                            _next_shard[0] += 1
-                        added_std += 1
-                for tid, cid in new_hf_tok.items():
-                    if tid not in token_to_condition:
-                        token_to_condition[tid] = cid
-                        token_to_side[tid]      = new_hf_side[tid]
-                        if hf_feed:
-                            hf_feed.add_token(tid)
-                        added_hf += 1
-                for tid, cid in new_lf_tok.items():
-                    if tid not in token_to_condition:
-                        token_to_condition[tid] = cid
-                        token_to_side[tid]      = new_lf_side[tid]
-                        if lf_feed:
-                            lf_feed.add_token(tid)
-                        added_lf += 1
-                for cid, q in {**new_std_q, **new_hf_q, **new_lf_q}.items():
+                std_tok, std_side, std_q = build_token_maps(new_standard)
+                added = _subscribe_new("std", std_tok, std_side)
+                new_q = dict(std_q)
+                counts_str = []
+                for label, slugs in SERIES_FEED_GROUPS.items():
+                    grp = fetch_series_markets(slugs=slugs)
+                    g_tok, g_side, g_q = build_token_maps(grp)
+                    added += _subscribe_new(label, g_tok, g_side)
+                    new_q.update(g_q)
+                    counts_str.append(f"{label}:{len(grp)}")
+                for cid, q in new_q.items():
                     if cid not in condition_to_question:
                         condition_to_question[cid] = q
-                added = added_std + added_hf + added_lf
                 if added:
                     logger.info(
-                        "Market refresh: +%d new tokens (+%d std, +%d hf, +%d lf) — "
-                        "totals: %d std / %d hf / %d lf",
-                        added, added_std, added_hf, added_lf,
-                        len(new_standard), len(new_hf), len(new_lf),
-                    )
-                else:
-                    logger.debug(
-                        "Market refresh: no new tokens "
-                        "(%d std + %d hf + %d lf scanned)",
-                        len(new_standard), len(new_hf), len(new_lf),
+                        "Market refresh: +%d new tokens — %d std, %s",
+                        added, len(new_standard), " ".join(counts_str),
                     )
             except Exception as exc:
                 logger.warning("Market refresh error: %s", exc)
@@ -477,7 +463,11 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
             now = time.time()
             if now - last_stats >= stats_interval:
                 last_stats = now
-                _print_stats(writer, condition_to_question, start_time)
+                _print_stats(writer, condition_to_question, start_time,
+                             active_by_feed=active_by_feed)
+                # Reset gauge sets for the next window
+                for s in active_by_feed.values():
+                    s.clear()
     except KeyboardInterrupt:
         # SIGINT already handled above, but just in case
         for feed in all_feeds:
@@ -489,7 +479,8 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
     _refresh_stop.set()
     logger.info("Flushing buffers...")
     writer.flush_all()
-    _print_stats(writer, condition_to_question, start_time, final=True)
+    _print_stats(writer, condition_to_question, start_time, final=True,
+                 active_by_feed=active_by_feed)
     logger.info("Done. Files written to %s", writer.get_dir())
 
 
@@ -498,6 +489,7 @@ def _print_stats(
     condition_to_question: dict[str, str],
     start_time: float,
     final: bool = False,
+    active_by_feed: dict[str, set] | None = None,
 ) -> None:
     now_str = datetime.now().strftime("%H:%M:%S")
     total = writer.total_events()
@@ -522,6 +514,32 @@ def _print_stats(
     )
     if top_str:
         print(f"  Top active: {top_str}", flush=True)
+
+    # Per-feed saturation gauge: distinct active markets this window vs the
+    # ~50-market WS push cap. A feed pinned at the cap is silently dropping
+    # the rest of its subscription — split it (raise --std-shards or break
+    # up the SERIES_FEED_GROUPS entry).
+    if active_by_feed:
+        gauge_parts = []
+        saturated = []
+        for feed_label in sorted(active_by_feed):
+            n = len(active_by_feed[feed_label])
+            mark = ""
+            if n >= SATURATION_WARN_THRESHOLD:
+                mark = " SATURATED"
+                saturated.append(feed_label)
+            gauge_parts.append(
+                f"{feed_label}:{n}/~{WS_MARKETS_PER_CONNECTION}{mark}"
+            )
+        print(f"  Feed activity: {'  '.join(gauge_parts)}", flush=True)
+        if saturated:
+            logger.warning(
+                "SATURATION: feed(s) %s pinned at the ~%d-market WS cap — "
+                "markets are being dropped. Increase --std-shards or split "
+                "the series group to capture more.",
+                ", ".join(saturated), WS_MARKETS_PER_CONNECTION,
+            )
+
     print(
         f"  Output: {writer.get_dir()}  |  Est. size: {size_mb:.1f} MB",
         flush=True,
