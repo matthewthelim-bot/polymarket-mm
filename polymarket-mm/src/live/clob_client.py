@@ -327,14 +327,20 @@ class ClobClient:
 
         side_str = (order.side.value if hasattr(order.side, "value") else str(order.side)).upper()
 
-        # Map time_in_force to OrderType
+        # Map time_in_force to OrderType. Polymarket has no IOC; FAK
+        # (fill-and-kill) is the equivalent — fill what's available, cancel
+        # the rest. An unknown TIF must not silently rest on the book.
         order_type_map = {
             "GTC": OrderType.GTC,
             "GTD": OrderType.GTD,
             "FOK": OrderType.FOK,
             "FAK": OrderType.FAK,
+            "IOC": OrderType.FAK,
         }
-        order_type = order_type_map.get(order.time_in_force.upper(), OrderType.GTC)
+        tif = order.time_in_force.upper()
+        if tif not in order_type_map:
+            raise ValueError(f"Unsupported time_in_force: {order.time_in_force}")
+        order_type = order_type_map[tif]
 
         order_args = OrderArgs(
             token_id=order.token_id,
@@ -342,7 +348,8 @@ class ClobClient:
             size=order.size,
             side=side_str,
         )
-        resp = py_client.create_and_post_order(order_args)
+        signed = py_client.create_order(order_args)
+        resp = py_client.post_order(signed, order_type)
 
         if resp is None:
             raise RuntimeError("Order placement returned None from py-clob-client")

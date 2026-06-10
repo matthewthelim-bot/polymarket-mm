@@ -50,15 +50,33 @@ def test_pro_rata_fill_proportion():
         quote_size=50.0,
     )
     result = model.simulate_fill(inp)
-    # pro-rata share: (50/500) * 100 = 10
-    assert result.filled_size == pytest.approx(10.0)
+    # Our quote joins the denominator: share = 50/(500+50), fill = share * 100
+    assert result.filled_size == pytest.approx(100.0 * 50.0 / 550.0)
 
 
-def test_pro_rata_zero_book_returns_no_fill():
+def test_pro_rata_own_quote_in_denominator():
+    """Our size >= displayed book must NOT yield share > 1 (the old bug)."""
     model = FillModel(FillModelConfig(queue_model=QueueModel.PRO_RATA))
-    inp = make_input(quote_price=0.46, market_trade_price=0.46, book_size_at_price=0.0)
+    inp = make_input(
+        quote_price=0.46,
+        market_trade_price=0.46,
+        market_trade_size=60.0,
+        book_size_at_price=50.0,
+        quote_size=100.0,
+    )
     result = model.simulate_fill(inp)
-    assert result.filled_size == pytest.approx(0.0)
+    # share = 100/150, fill = 60 * 100/150 = 40 — never the full trade
+    assert result.filled_size == pytest.approx(40.0)
+
+
+def test_pro_rata_zero_book_we_are_whole_queue():
+    """Zero displayed depth means our order IS the queue → full pro-rata fill."""
+    model = FillModel(FillModelConfig(queue_model=QueueModel.PRO_RATA))
+    inp = make_input(quote_price=0.46, market_trade_price=0.46,
+                     market_trade_size=200.0, book_size_at_price=0.0,
+                     quote_size=100.0)
+    result = model.simulate_fill(inp)
+    assert result.filled_size == pytest.approx(100.0)
 
 
 # --- BACK model ---
@@ -87,11 +105,26 @@ def test_back_fills_when_book_cleared():
         quote_size=100.0,
     )
     result = model.simulate_fill(inp)
+    # 600 clears the 500 book; 100 contracts remain for us → full fill
     assert result.filled_size == pytest.approx(100.0)
 
 
-def test_back_exact_book_exhaustion_fills():
-    """trade_size exactly equals book_size → we are filled (>= boundary)."""
+def test_back_partial_fill_from_overflow():
+    """Only the trade volume beyond the displayed book reaches us."""
+    model = FillModel(FillModelConfig(queue_model=QueueModel.BACK))
+    inp = make_input(
+        quote_price=0.46,
+        market_trade_price=0.46,
+        market_trade_size=530.0,   # 30 contracts beyond the book
+        book_size_at_price=500.0,
+        quote_size=100.0,
+    )
+    result = model.simulate_fill(inp)
+    assert result.filled_size == pytest.approx(30.0)
+
+
+def test_back_exact_book_exhaustion_no_fill():
+    """trade_size exactly equals book_size → nothing left for us at the back."""
     model = FillModel(FillModelConfig(queue_model=QueueModel.BACK))
     inp = make_input(
         quote_price=0.46,
@@ -101,7 +134,7 @@ def test_back_exact_book_exhaustion_fills():
         quote_size=100.0,
     )
     result = model.simulate_fill(inp)
-    assert result.filled_size == pytest.approx(100.0)
+    assert result.filled_size == pytest.approx(0.0)
 
 
 # --- Latency ---

@@ -154,7 +154,13 @@ class BookFeed:
         while not self._stop_event.is_set():
             try:
                 await self._connect_and_consume()
+                # Graceful server close also needs a pause — a server that
+                # repeatedly accepts-then-closes would otherwise be hammered
+                # in a zero-delay reconnect loop and rate-limit us.
                 delay = self._config.reconnect_delay_seconds  # reset on clean exit
+                if not self._stop_event.is_set():
+                    logger.info("WebSocket closed cleanly. Reconnecting in %.1fs...", delay)
+                    await asyncio.sleep(delay)
             except Exception as exc:
                 if self._stop_event.is_set():
                     break

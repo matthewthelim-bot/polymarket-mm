@@ -38,17 +38,38 @@ class FairValueEstimator:
         external_weight: weight on external signals [0, 1]; remainder goes to TWAP
     """
 
-    def __init__(self, twap_window_seconds: int = 300, external_weight: float = 0.0):
+    def __init__(
+        self,
+        twap_window_seconds: int = 300,
+        external_weight: float = 0.0,
+        signal_max_age_seconds: int = 86_400,
+    ):
         self.twap_window_seconds = twap_window_seconds
         self.external_weight = external_weight
+        self.signal_max_age_seconds = signal_max_age_seconds
         self._trades: list[TradeObservation] = []
-        self._signals: list[ExternalSignal] = []
+        # Latest signal per source — repeated observations from one source
+        # must not outvote a fresh signal from another (a source publishing
+        # ten times is one opinion, not ten).
+        self._signals: dict[str, ExternalSignal] = {}
 
     def on_trade(self, trade: TradeObservation) -> None:
         self._trades.append(trade)
+        # Prune observations that have aged out of the TWAP window so the
+        # list stays bounded in a long-running process and _compute_twap
+        # stays O(window) rather than O(all trades ever).
+        cutoff = trade.timestamp.timestamp() - self.twap_window_seconds
+        drop = 0
+        for t in self._trades:
+            if t.timestamp.timestamp() < cutoff:
+                drop += 1
+            else:
+                break
+        if drop:
+            del self._trades[:drop]
 
     def on_external_signal(self, signal: ExternalSignal) -> None:
-        self._signals.append(signal)
+        self._signals[signal.source] = signal
 
     def estimate(self, as_of: datetime) -> Optional[float]:
         """
@@ -63,7 +84,16 @@ class FairValueEstimator:
         if self.external_weight == 0.0 or not self._signals:
             return twap
 
-        external_avg = sum(s.probability for s in self._signals) / len(self._signals)
+        # Only signals within the freshness window participate
+        signal_cutoff = as_of.timestamp() - self.signal_max_age_seconds
+        fresh = [
+            s for s in self._signals.values()
+            if s.timestamp.timestamp() >= signal_cutoff
+        ]
+        if not fresh:
+            return twap
+
+        external_avg = sum(s.probability for s in fresh) / len(fresh)
         return (1 - self.external_weight) * twap + self.external_weight * external_avg
 
     def _compute_twap(self, as_of: datetime) -> Optional[float]:

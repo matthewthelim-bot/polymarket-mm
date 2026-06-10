@@ -677,18 +677,27 @@ class QuoteLoop:
         # Portfolio-level cap: probe with a minimal notional to see if any new open
         # would be rejected (use a small probe rather than actual quote notional to
         # avoid false negatives on large size orders).
-        if not long_capped and self._portfolio is not None:
+        #
+        # can_open() has no direction — it caps gross exposure. If we suppressed
+        # BOTH sides whenever it binds, the side that closes existing inventory
+        # would go dark and the position could never be unwound (capital locked
+        # until resolution). So: suppress only the dominant-exposure side; keep
+        # the opposing side live as the exit path. Only when this market holds
+        # no inventory at all does the portfolio cap suppress both sides.
+        if self._portfolio is not None and not (long_capped and short_capped):
             probe = 0.01  # 1 cent probe — if even this is blocked, we're at cap
-            long_capped = long_capped or not self._portfolio.can_open(
+            portfolio_capped = not self._portfolio.can_open(
                 self.config.event_key, self.config.market_id,
                 probe, self.config.days_to_resolution
             )
-        if not short_capped and self._portfolio is not None:
-            probe = 0.01
-            short_capped = short_capped or not self._portfolio.can_open(
-                self.config.event_key, self.config.market_id,
-                probe, self.config.days_to_resolution
-            )
+            if portfolio_capped:
+                if self._long_notional > self._short_notional:
+                    long_capped = True   # asks stay live to close longs
+                elif self._short_notional > self._long_notional:
+                    short_capped = True  # bids stay live to close shorts
+                else:
+                    long_capped = True
+                    short_capped = True
 
         if long_capped:
             logger.info(
@@ -741,45 +750,48 @@ class QuoteLoop:
         # Pad ratios if config list is shorter than ladder_levels.
         ratios = list(self.config.ladder_size_ratios)
         while len(ratios) < n:
-            ratios.append(ratios[-1])
-        sizes = [decision.bid_size * ratios[i] for i in range(n)]
+            ratios.append(ratios[-1] if ratios else 1.0)
+        # Bids and asks size independently: in ONE_SIDE_FILLED the engine sets
+        # bid_size=0 but keeps ask_size>0 so the flatten leg stays quoted.
+        bid_sizes = [decision.bid_size * ratios[i] for i in range(n)]
+        ask_sizes = [decision.ask_size * ratios[i] for i in range(n)]
 
         # --- Maintain all ladder levels (asymmetric when capped) ---
         now = time.monotonic()
         for i in range(n):
-            # Bids open longs → cancel if long-capped, otherwise maintain
-            if long_capped:
+            # Bids open longs → cancel if long-capped or engine sized to zero
+            if long_capped or bid_sizes[i] <= 0:
                 self._cancel_resting(self._yes_bids[i], label=f"yes_bid_{i}_cap")
                 self._yes_bids[i] = None
             else:
                 self._yes_bids[i] = self._maintain_order(
                     self._yes_bids[i], self.config.yes_token_id, Side.BUY,
-                    yes_bid_prices[i], sizes[i], f"yes_bid_{i}", now,
+                    yes_bid_prices[i], bid_sizes[i], f"yes_bid_{i}", now,
                 )
-            # Asks open shorts → cancel if short-capped, otherwise maintain
-            if short_capped:
+            # Asks open shorts → cancel if short-capped or engine sized to zero
+            if short_capped or ask_sizes[i] <= 0:
                 self._cancel_resting(self._yes_asks[i], label=f"yes_ask_{i}_cap")
                 self._yes_asks[i] = None
             else:
                 self._yes_asks[i] = self._maintain_order(
                     self._yes_asks[i], self.config.yes_token_id, Side.SELL,
-                    yes_ask_prices[i], sizes[i], f"yes_ask_{i}", now,
+                    yes_ask_prices[i], ask_sizes[i], f"yes_ask_{i}", now,
                 )
-            if long_capped:
+            if long_capped or bid_sizes[i] <= 0:
                 self._cancel_resting(self._no_bids[i], label=f"no_bid_{i}_cap")
                 self._no_bids[i] = None
             else:
                 self._no_bids[i] = self._maintain_order(
                     self._no_bids[i], self.config.no_token_id, Side.BUY,
-                    no_bid_prices[i], sizes[i], f"no_bid_{i}", now,
+                    no_bid_prices[i], bid_sizes[i], f"no_bid_{i}", now,
                 )
-            if short_capped:
+            if short_capped or ask_sizes[i] <= 0:
                 self._cancel_resting(self._no_asks[i], label=f"no_ask_{i}_cap")
                 self._no_asks[i] = None
             else:
                 self._no_asks[i] = self._maintain_order(
                     self._no_asks[i], self.config.no_token_id, Side.SELL,
-                    no_ask_prices[i], sizes[i], f"no_ask_{i}", now,
+                    no_ask_prices[i], ask_sizes[i], f"no_ask_{i}", now,
                 )
 
     def _maintain_order(
@@ -940,8 +952,11 @@ class QuoteLoop:
         Cancel a resting order.
 
         Returns True if successfully cancelled (order was still live).
-        Returns False if cancel was rejected — order was likely already filled
-        or there was a network error. In both cases, treat the order as gone.
+        Returns False ONLY if the exchange explicitly rejected the cancel —
+        meaning the order was already filled. A network error is NOT a
+        rejection: the order may still be live, so we retry once and, if the
+        retry also errors, return True so the caller still sends the hedge
+        (an occasional double-hedge is recoverable; a naked fill is not).
         """
         if order is None:
             return True  # nothing to cancel
@@ -954,26 +969,30 @@ class QuoteLoop:
             self.stats.orders_cancelled += 1
             return True  # dry-run: always "succeeds"
 
-        try:
-            ok = self._client.cancel_order(order.order_id)
-            if ok:
-                self.stats.orders_cancelled += 1
-                logger.debug(
-                    "[%s] Cancelled %s order=%s", self.config.market_id, label, order.order_id,
+        for attempt in (1, 2):
+            try:
+                ok = self._client.cancel_order(order.order_id)
+                if ok:
+                    self.stats.orders_cancelled += 1
+                    logger.debug(
+                        "[%s] Cancelled %s order=%s", self.config.market_id, label, order.order_id,
+                    )
+                else:
+                    logger.info(
+                        "[%s] Cancel rejected for %s order=%s — likely already filled",
+                        self.config.market_id, label, order.order_id,
+                    )
+                return ok
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Cancel error (attempt %d) for %s %s: %s",
+                    self.config.market_id, attempt, label, order.order_id, exc,
                 )
-            else:
-                logger.info(
-                    "[%s] Cancel rejected for %s order=%s — likely already filled",
-                    self.config.market_id, label, order.order_id,
-                )
-            return ok
-        except Exception as exc:
-            logger.warning(
-                "[%s] Cancel error for %s %s: %s",
-                self.config.market_id, label, order.order_id, exc,
-            )
-            self.stats.errors += 1
-            return False  # treat as already filled (conservative)
+                self.stats.errors += 1
+        # Both attempts errored: order state unknown, assume still live so the
+        # fill handler sends the taker hedge rather than booking a fictitious
+        # maker-maker cycle and leaving the position naked.
+        return True
 
     def _cancel_all(self) -> None:
         """Cancel all resting orders across all ladder levels on all 4 sides."""

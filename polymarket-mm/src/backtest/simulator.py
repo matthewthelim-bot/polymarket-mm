@@ -44,7 +44,7 @@ from typing import Optional, Union
 
 from src.fee_model import FeeModel
 from src.data.schemas import (
-    MarketMetadata, OrderBook, Fill, Side,
+    MarketMetadata, OrderBook, Fill, Side, InventoryState,
 )
 # Optional import — avoids hard dependency if portfolio_state is not installed.
 try:
@@ -486,6 +486,26 @@ class BacktestSimulator:
     # Dual-book maker-taker fill checks
     # ------------------------------------------------------------------
 
+    def _cycle_net_edge_pc(
+        self, maker_price: float, taker_price: float, gross_pc: float
+    ) -> float:
+        """Net edge per contract for an arb cycle: gross + rebate − taker fee.
+
+        A cycle whose gross edge is smaller than the net fee cost is a
+        guaranteed loss — the profitability guards must use this, not the
+        gross price sum alone (at fee_rate=0.07 the taker fee near p=0.5 is
+        ~1.75 cents/contract, far larger than a 1-tick gross edge).
+        """
+        rebate_pc = self.fee_model.maker_rebate(
+            size=1.0, price=maker_price,
+            fee_rate=self.meta.fee_rate,
+            rebate_fraction=self.meta.rebate_fraction,
+        )
+        fee_pc = self.fee_model.taker_fee(
+            size=1.0, price=taker_price, fee_rate=self.meta.fee_rate,
+        )
+        return gross_pc + rebate_pc - fee_pc
+
     def _check_yes_bid_fill(self, trade: Fill, fv: float) -> None:
         """YES bid ladder fill → immediately take NO at best NO ask (taker).
 
@@ -520,13 +540,19 @@ class BacktestSimulator:
             self._result.num_no_hedge_depth += 1
             return
         no_ask = self._no_book.asks[0].price
+        # Hedge depth budget for this trade event: the opposing best level is a
+        # finite resource — every hedged cycle consumes it. Without this budget
+        # the same depth would be (incorrectly) reused across chunks and levels.
+        hedge_budget = self._no_book.asks[0].size
 
         n = self.config.ladder_levels
         ratios = list(self.config.ladder_size_ratios)
         while len(ratios) < n:
-            ratios.append(ratios[-1])
+            ratios.append(ratios[-1] if ratios else 1.0)
 
         for level in range(n):
+            if hedge_budget <= 0.5:
+                break
             offset = self.config.ladder_offset_from_best + level * self.config.ladder_tick_spacing
             yes_bid = round(max(0.01, min(0.99, anchor_bid - offset)), 3)
             level_size = self.config.quote_size * ratios[level]
@@ -535,8 +561,8 @@ class BacktestSimulator:
             if trade.price > yes_bid + 1e-9:
                 continue
 
-            # Profitability guard
-            if yes_bid + no_ask >= 1.0 - 1e-9:
+            # Profitability guard — net of taker fee and maker rebate
+            if self._cycle_net_edge_pc(yes_bid, no_ask, 1.0 - yes_bid - no_ask) <= 1e-9:
                 continue
 
             # Iceberg: loop through display-size chunks drawn from the full level.
@@ -545,7 +571,7 @@ class BacktestSimulator:
             remaining_hidden = level_size
             remaining_trade  = trade.size
 
-            while remaining_hidden > 0.5 and remaining_trade > 0.5:
+            while remaining_hidden > 0.5 and remaining_trade > 0.5 and hedge_budget > 0.5:
                 chunk = min(display, remaining_hidden)
                 fill_inp = FillModelInput(
                     quote_price=yes_bid,
@@ -558,8 +584,7 @@ class BacktestSimulator:
                 if maker_filled <= 0:
                     break
 
-                hedge_available = self._no_book.asks[0].size
-                cycle_size = min(maker_filled, hedge_available)
+                cycle_size = min(maker_filled, hedge_budget)
                 if cycle_size <= 0:
                     break
 
@@ -574,6 +599,7 @@ class BacktestSimulator:
                     maker_token="YES",
                 )
                 self._as_tracker.on_fill(yes_bid, trade.timestamp)
+                hedge_budget     -= cycle_size
                 remaining_hidden -= maker_filled
                 remaining_trade  -= maker_filled
 
@@ -607,13 +633,16 @@ class BacktestSimulator:
             self._result.num_no_hedge_depth += 1
             return
         no_bid = self._no_book.bids[0].price
+        hedge_budget = self._no_book.bids[0].size
 
         n = self.config.ladder_levels
         ratios = list(self.config.ladder_size_ratios)
         while len(ratios) < n:
-            ratios.append(ratios[-1])
+            ratios.append(ratios[-1] if ratios else 1.0)
 
         for level in range(n):
+            if hedge_budget <= 0.5:
+                break
             offset = self.config.ladder_offset_from_best + level * self.config.ladder_tick_spacing
             yes_ask = round(max(0.01, min(0.99, anchor_ask + offset)), 3)
             level_size = self.config.quote_size * ratios[level]
@@ -622,8 +651,8 @@ class BacktestSimulator:
             if trade.price < yes_ask - 1e-9:
                 continue
 
-            # Profitability guard
-            if yes_ask + no_bid <= 1.0 + 1e-9:
+            # Profitability guard — net of taker fee and maker rebate
+            if self._cycle_net_edge_pc(yes_ask, no_bid, yes_ask + no_bid - 1.0) <= 1e-9:
                 continue
 
             # Iceberg: loop through chunks
@@ -631,14 +660,13 @@ class BacktestSimulator:
             remaining_hidden = level_size
             remaining_trade  = trade.size
 
-            while remaining_hidden > 0.5 and remaining_trade > 0.5:
+            while remaining_hidden > 0.5 and remaining_trade > 0.5 and hedge_budget > 0.5:
                 chunk = min(display, remaining_hidden)
                 maker_filled = min(remaining_trade, chunk)
                 if maker_filled <= 0:
                     break
 
-                hedge_available = self._no_book.bids[0].size
-                cycle_size = min(maker_filled, hedge_available)
+                cycle_size = min(maker_filled, hedge_budget)
                 if cycle_size <= 0:
                     break
 
@@ -652,6 +680,7 @@ class BacktestSimulator:
                     maker_token="YES",
                 )
                 self._as_tracker.on_fill(yes_ask, trade.timestamp)
+                hedge_budget     -= cycle_size
                 remaining_hidden -= maker_filled
                 remaining_trade  -= maker_filled
 
@@ -687,13 +716,16 @@ class BacktestSimulator:
             self._result.num_no_hedge_depth += 1
             return
         yes_ask = self._current_book.asks[0].price
+        hedge_budget = self._current_book.asks[0].size
 
         n = self.config.ladder_levels
         ratios = list(self.config.ladder_size_ratios)
         while len(ratios) < n:
-            ratios.append(ratios[-1])
+            ratios.append(ratios[-1] if ratios else 1.0)
 
         for level in range(n):
+            if hedge_budget <= 0.5:
+                break
             offset = self.config.ladder_offset_from_best + level * self.config.ladder_tick_spacing
             no_bid = round(max(0.01, min(0.99, anchor_no_bid - offset)), 3)
             level_size = self.config.quote_size * ratios[level]
@@ -701,7 +733,8 @@ class BacktestSimulator:
             if trade.price > no_bid + 1e-9:
                 continue
 
-            if no_bid + yes_ask >= 1.0 - 1e-9:
+            # Profitability guard — net of taker fee and maker rebate
+            if self._cycle_net_edge_pc(no_bid, yes_ask, 1.0 - no_bid - yes_ask) <= 1e-9:
                 continue
 
             # Iceberg: loop through chunks
@@ -709,7 +742,7 @@ class BacktestSimulator:
             remaining_hidden = level_size
             remaining_trade  = trade.size
 
-            while remaining_hidden > 0.5 and remaining_trade > 0.5:
+            while remaining_hidden > 0.5 and remaining_trade > 0.5 and hedge_budget > 0.5:
                 chunk = min(display, remaining_hidden)
                 fill_inp = FillModelInput(
                     quote_price=no_bid,
@@ -722,8 +755,7 @@ class BacktestSimulator:
                 if maker_filled <= 0:
                     break
 
-                hedge_available = self._current_book.asks[0].size
-                cycle_size = min(maker_filled, hedge_available)
+                cycle_size = min(maker_filled, hedge_budget)
                 if cycle_size <= 0:
                     break
 
@@ -738,6 +770,7 @@ class BacktestSimulator:
                     maker_token="NO",
                 )
                 self._as_tracker.on_fill(no_bid, trade.timestamp)
+                hedge_budget     -= cycle_size
                 remaining_hidden -= maker_filled
                 remaining_trade  -= maker_filled
 
@@ -771,13 +804,16 @@ class BacktestSimulator:
             self._result.num_no_hedge_depth += 1
             return
         yes_bid = self._current_book.bids[0].price
+        hedge_budget = self._current_book.bids[0].size
 
         n = self.config.ladder_levels
         ratios = list(self.config.ladder_size_ratios)
         while len(ratios) < n:
-            ratios.append(ratios[-1])
+            ratios.append(ratios[-1] if ratios else 1.0)
 
         for level in range(n):
+            if hedge_budget <= 0.5:
+                break
             offset = self.config.ladder_offset_from_best + level * self.config.ladder_tick_spacing
             no_ask = round(max(0.01, min(0.99, anchor_no_ask + offset)), 3)
             level_size = self.config.quote_size * ratios[level]
@@ -785,7 +821,8 @@ class BacktestSimulator:
             if trade.price < no_ask - 1e-9:
                 continue
 
-            if no_ask + yes_bid <= 1.0 + 1e-9:
+            # Profitability guard — net of taker fee and maker rebate
+            if self._cycle_net_edge_pc(no_ask, yes_bid, no_ask + yes_bid - 1.0) <= 1e-9:
                 continue
 
             # Iceberg: loop through chunks
@@ -793,14 +830,13 @@ class BacktestSimulator:
             remaining_hidden = level_size
             remaining_trade  = trade.size
 
-            while remaining_hidden > 0.5 and remaining_trade > 0.5:
+            while remaining_hidden > 0.5 and remaining_trade > 0.5 and hedge_budget > 0.5:
                 chunk = min(display, remaining_hidden)
                 maker_filled = min(remaining_trade, chunk)
                 if maker_filled <= 0:
                     break
 
-                hedge_available = self._current_book.bids[0].size
-                cycle_size = min(maker_filled, hedge_available)
+                cycle_size = min(maker_filled, hedge_budget)
                 if cycle_size <= 0:
                     break
 
@@ -814,6 +850,7 @@ class BacktestSimulator:
                     maker_token="NO",
                 )
                 self._as_tracker.on_fill(no_ask, trade.timestamp)
+                hedge_budget     -= cycle_size
                 remaining_hidden -= maker_filled
                 remaining_trade  -= maker_filled
 
@@ -831,104 +868,12 @@ class BacktestSimulator:
     ) -> None:
         """Bid-arb event: combined cost (maker_price + taker_price) < 1.0.
 
-        Two cases:
-          A) Open shorts exist → close the oldest short (round-trip completed).
-          B) No open shorts → open a new long position.
-
-        Entry fees are recorded immediately; round-trip PnL is only finalised on close.
-        Positions not closed during the simulation are settled at $1.00 in run().
+        Closes open shorts FIFO; any remainder opens a new long.
         """
-        # Portfolio cap check FIRST, before any counters/fees are recorded —
-        # a blocked cycle models "we wouldn't have been quoting", so it must
-        # leave zero trace in fee/rebate/cycle accounting.
-        if not self._open_shorts and self._portfolio is not None:
-            if not self._portfolio.can_open(
-                self.config.event_key, self.config.market_id,
-                (maker_price + taker_price) * size,
-                self.config.days_to_resolution,
-            ):
-                self._result.num_portfolio_blocked += 1
-                return
-
-        maker_rebate = self.fee_model.maker_rebate(
-            size=size, price=maker_price,
-            fee_rate=self.meta.fee_rate,
-            rebate_fraction=self.meta.rebate_fraction,
+        self._record_arb_cycle(
+            maker_price, taker_price, size, timestamp, maker_token,
+            open_direction="long",
         )
-        taker_fee = self.fee_model.taker_fee(
-            size=size, price=taker_price,
-            fee_rate=self.meta.fee_rate,
-        )
-        entry_fees_net = maker_rebate - taker_fee
-        self._result.total_rebates_received += maker_rebate
-        self._result.total_fees_paid += taker_fee
-        self._result.num_bid_arb_cycles += 1
-
-        if self._open_shorts:
-            # Close the oldest short position (FIFO)
-            short = self._open_shorts.pop(0)
-            close_size = min(size, short.size)
-
-            # Round-trip PnL: opened short at (short.entry_yes + short.entry_no) > 1,
-            # closing now by buying back at (maker_price + taker_price) < 1.
-            gross = (short.entry_yes + short.entry_no - maker_price - taker_price) * close_size
-            net = gross + short.entry_fees_net + entry_fees_net
-            self._result.total_spread_pnl += net
-            self._result.round_trip_pnl += net
-            self._result.num_round_trips += 1
-            self._result.num_cycles_completed += 1
-            self._result.per_cycle_pnl.append(net)
-            self._result.per_roundtrip_pnl.append(net)
-            if net > 0:
-                self._result.num_profitable_cycles += 1
-            try:
-                held_s = (timestamp - short.opened_at).total_seconds()
-                self._result.holding_times_seconds.append(held_s)
-            except Exception:
-                pass
-
-            # Release short notional (proportional if partial close)
-            close_notional = (short.entry_yes + short.entry_no) * close_size
-            self._short_notional -= close_notional
-            self._short_notional = max(0.0, self._short_notional)
-            if self._portfolio is not None:
-                self._portfolio.close_position(
-                    self.config.event_key, self.config.market_id,
-                    close_notional, self.config.days_to_resolution
-                )
-
-            # If short was larger, put remainder back
-            if short.size > close_size:
-                short.size -= close_size
-                self._open_shorts.insert(0, short)
-        else:
-            # Open a new long (portfolio caps already checked at function top)
-            yes_price = maker_price if maker_token == "YES" else taker_price
-            no_price  = taker_price if maker_token == "YES" else maker_price
-            open_notional = (yes_price + no_price) * size
-            pos = _OpenPosition(
-                direction="long",
-                entry_yes=yes_price,
-                entry_no=no_price,
-                size=size,
-                entry_fees_net=entry_fees_net,
-                opened_at=timestamp,
-            )
-            self._open_longs.append(pos)
-            self._long_notional += open_notional
-            self._result.num_longs_opened += 1
-            self._result.total_capital_consumed += open_notional
-            self._result.max_concurrent_open = max(
-                self._result.max_concurrent_open,
-                len(self._open_longs) + len(self._open_shorts),
-            )
-            if self._portfolio is not None:
-                self._portfolio.open_position(
-                    self.config.event_key, self.config.market_id,
-                    open_notional, self.config.days_to_resolution
-                )
-
-        self.inventory_manager.add_flatten(size, taker_price)
 
     def _record_ask_arb_cycle(
         self,
@@ -940,44 +885,67 @@ class BacktestSimulator:
     ) -> None:
         """Ask-arb event: combined proceeds (maker_price + taker_price) > 1.0.
 
-        Two cases:
-          A) Open longs exist → close the oldest long (round-trip completed).
-          B) No open longs → open a new short position.
+        Closes open longs FIFO; any remainder opens a new short.
         """
-        # Portfolio cap check FIRST, before any counters/fees are recorded
-        # (mirrors _record_bid_arb_cycle — blocked must leave zero trace).
-        if not self._open_longs and self._portfolio is not None:
-            if not self._portfolio.can_open(
-                self.config.event_key, self.config.market_id,
-                (maker_price + taker_price) * size,
-                self.config.days_to_resolution,
-            ):
-                self._result.num_portfolio_blocked += 1
-                return
+        self._record_arb_cycle(
+            maker_price, taker_price, size, timestamp, maker_token,
+            open_direction="short",
+        )
 
-        maker_rebate = self.fee_model.maker_rebate(
-            size=size, price=maker_price,
+    def _record_arb_cycle(
+        self,
+        maker_price: float,
+        taker_price: float,
+        size: float,
+        timestamp,
+        maker_token: str,
+        open_direction: str,
+    ) -> None:
+        """Shared bid/ask arb-cycle accounting.
+
+        open_direction="long"  → bid-arb: closes shorts FIFO, remainder opens long
+        open_direction="short" → ask-arb: closes longs  FIFO, remainder opens short
+
+        Correctness invariants:
+          - Entry fees on a position are prorated by close fraction so partial
+            closes never double-count entry_fees_net.
+          - A cycle larger than the oldest position keeps closing FIFO down the
+            list; any remainder opens a new position (size never vanishes).
+          - Fees/rebates are booked only on executed contracts — a portfolio
+            block on the open leaves zero trace for that portion.
+        """
+        closing = self._open_shorts if open_direction == "long" else self._open_longs
+        gross_sign = 1.0 if open_direction == "long" else -1.0
+
+        # Per-contract fees so partial executions book exactly what traded
+        rebate_pc = self.fee_model.maker_rebate(
+            size=1.0, price=maker_price,
             fee_rate=self.meta.fee_rate,
             rebate_fraction=self.meta.rebate_fraction,
         )
-        taker_fee = self.fee_model.taker_fee(
-            size=size, price=taker_price,
+        fee_pc = self.fee_model.taker_fee(
+            size=1.0, price=taker_price,
             fee_rate=self.meta.fee_rate,
         )
-        entry_fees_net = maker_rebate - taker_fee
-        self._result.total_rebates_received += maker_rebate
-        self._result.total_fees_paid += taker_fee
-        self._result.num_ask_arb_cycles += 1
+        fees_net_pc = rebate_pc - fee_pc
 
-        if self._open_longs:
-            # Close the oldest long position (FIFO)
-            long = self._open_longs.pop(0)
-            close_size = min(size, long.size)
+        remaining = size
+        executed = 0.0
 
-            # Round-trip PnL: opened long at (long.entry_yes + long.entry_no) < 1,
-            # closing now by selling at (maker_price + taker_price) > 1.
-            gross = (maker_price + taker_price - long.entry_yes - long.entry_no) * close_size
-            net = gross + long.entry_fees_net + entry_fees_net
+        # --- A) Close opposing positions FIFO ---
+        while remaining > 1e-9 and closing:
+            pos = closing[0]
+            close_size = min(remaining, pos.size)
+
+            # Prorate the position's remaining entry fees by close fraction
+            fee_share = pos.entry_fees_net * (close_size / pos.size)
+
+            # gross_sign=+1: short opened > 1, buy back < 1 (bid-arb)
+            # gross_sign=-1: long  opened < 1, sell at  > 1 (ask-arb)
+            gross = gross_sign * (
+                pos.entry_yes + pos.entry_no - maker_price - taker_price
+            ) * close_size
+            net = gross + fee_share + fees_net_pc * close_size
             self._result.total_spread_pnl += net
             self._result.round_trip_pnl += net
             self._result.num_round_trips += 1
@@ -987,53 +955,78 @@ class BacktestSimulator:
             if net > 0:
                 self._result.num_profitable_cycles += 1
             try:
-                held_s = (timestamp - long.opened_at).total_seconds()
+                held_s = (timestamp - pos.opened_at).total_seconds()
                 self._result.holding_times_seconds.append(held_s)
             except Exception:
                 pass
 
-            # Release long notional (proportional if partial close)
-            close_notional = (long.entry_yes + long.entry_no) * close_size
-            self._long_notional -= close_notional
-            self._long_notional = max(0.0, self._long_notional)
+            close_notional = (pos.entry_yes + pos.entry_no) * close_size
+            if open_direction == "long":
+                self._short_notional = max(0.0, self._short_notional - close_notional)
+            else:
+                self._long_notional = max(0.0, self._long_notional - close_notional)
             if self._portfolio is not None:
                 self._portfolio.close_position(
                     self.config.event_key, self.config.market_id,
                     close_notional, self.config.days_to_resolution
                 )
 
-            # If long was larger, put remainder back
-            if long.size > close_size:
-                long.size -= close_size
-                self._open_longs.insert(0, long)
-        else:
-            # Open a new short (portfolio caps already checked at function top)
+            if pos.size > close_size + 1e-9:
+                pos.size -= close_size
+                pos.entry_fees_net -= fee_share
+            else:
+                closing.pop(0)
+            remaining -= close_size
+            executed += close_size
+
+        # --- B) Open a new position with the remainder (portfolio-capped) ---
+        if remaining > 1e-9:
             yes_price = maker_price if maker_token == "YES" else taker_price
             no_price  = taker_price if maker_token == "YES" else maker_price
-            open_notional = (yes_price + no_price) * size
-            pos = _OpenPosition(
-                direction="short",
-                entry_yes=yes_price,
-                entry_no=no_price,
-                size=size,
-                entry_fees_net=entry_fees_net,
-                opened_at=timestamp,
-            )
-            self._open_shorts.append(pos)
-            self._short_notional += open_notional
-            self._result.num_shorts_opened += 1
-            self._result.total_capital_consumed += open_notional
-            self._result.max_concurrent_open = max(
-                self._result.max_concurrent_open,
-                len(self._open_longs) + len(self._open_shorts),
-            )
-            if self._portfolio is not None:
-                self._portfolio.open_position(
-                    self.config.event_key, self.config.market_id,
-                    open_notional, self.config.days_to_resolution
-                )
+            open_notional = (yes_price + no_price) * remaining
 
-        self.inventory_manager.add_flatten(size, taker_price)
+            allowed = self._portfolio is None or self._portfolio.try_open(
+                self.config.event_key, self.config.market_id,
+                open_notional, self.config.days_to_resolution,
+            )
+            if allowed:
+                pos = _OpenPosition(
+                    direction=open_direction,
+                    entry_yes=yes_price,
+                    entry_no=no_price,
+                    size=remaining,
+                    entry_fees_net=fees_net_pc * remaining,
+                    opened_at=timestamp,
+                )
+                if open_direction == "long":
+                    self._open_longs.append(pos)
+                    self._long_notional += open_notional
+                    self._result.num_longs_opened += 1
+                else:
+                    self._open_shorts.append(pos)
+                    self._short_notional += open_notional
+                    self._result.num_shorts_opened += 1
+                self._result.total_capital_consumed += open_notional
+                self._result.max_concurrent_open = max(
+                    self._result.max_concurrent_open,
+                    len(self._open_longs) + len(self._open_shorts),
+                )
+                executed += remaining
+            else:
+                self._result.num_portfolio_blocked += 1
+
+        if executed <= 1e-9:
+            return
+
+        # Book fees/rebates only on what actually executed
+        self._result.total_rebates_received += rebate_pc * executed
+        self._result.total_fees_paid += fee_pc * executed
+        if open_direction == "long":
+            self._result.num_bid_arb_cycles += 1
+        else:
+            self._result.num_ask_arb_cycles += 1
+
+        self.inventory_manager.add_flatten(executed, taker_price)
 
     # ------------------------------------------------------------------
     # Quote computation helpers
@@ -1042,6 +1035,24 @@ class BacktestSimulator:
     def _compute_quote(self, fv: float, timestamp) -> object | None:
         """Compute QuoteDecision for the current YES book state."""
         inv_state = self.inventory_manager.state()
+
+        # Dual-book mode never routes maker fills through inventory_manager
+        # (each cycle is hedged at entry), so its state is permanently zero —
+        # which would blind the regime classifier to real position load. Open
+        # positions awaiting close ARE the inventory in this mode: inject them
+        # so INVENTORY_REDUCED / WAREHOUSE / HEDGE_PENDING can engage.
+        if self._ever_seen_tagged_book:
+            open_contracts = (
+                sum(p.size for p in self._open_longs)
+                + sum(p.size for p in self._open_shorts)
+            )
+            if open_contracts > 0:
+                inv_state = InventoryState(
+                    market_id=inv_state.market_id,
+                    hedgeable_contracts=inv_state.hedgeable_contracts + open_contracts,
+                    skew_contracts=inv_state.skew_contracts,
+                    avg_fill_price=inv_state.avg_fill_price,
+                )
         if self.config.resolution_time is not None:
             delta = self.config.resolution_time - timestamp
             time_to_res = max(0.0, delta.total_seconds() / 3600.0)

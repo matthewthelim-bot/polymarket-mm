@@ -45,7 +45,16 @@ def _parse_env_file(path: Path) -> None:
                     continue
                 key, _, value = line.partition("=")
                 key = key.strip()
-                value = value.strip().strip('"').strip("'")
+                value = value.strip()
+                # A quoted value is taken verbatim between its matching quotes
+                # (quotes inside secrets survive; inline '#' is part of the value).
+                # An unquoted value ends at the first ' #' comment marker.
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                else:
+                    comment_at = value.find(" #")
+                    if comment_at != -1:
+                        value = value[:comment_at].rstrip()
                 if key and key not in os.environ:
                     os.environ[key] = value
     except OSError:

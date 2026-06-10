@@ -81,17 +81,22 @@ class FillModel:
             return min(inp.market_trade_size, inp.quote_size)
 
         elif model == QueueModel.PRO_RATA:
-            if inp.book_size_at_price <= 0:
+            # book_size_at_price is the RECORDED depth at our price and cannot
+            # include our own simulated order — our quote must join the
+            # denominator or our share is overstated (and exceeds 1 whenever
+            # our size >= displayed book). Correct: ours / (book + ours).
+            total_at_price = inp.book_size_at_price + inp.quote_size
+            if total_at_price <= 0:
                 return 0.0
-            # Note: quote_size may exceed book_size_at_price for malformed inputs;
-            # the outer min(filled, quote_size) in simulate_fill will cap it.
-            share = inp.quote_size / inp.book_size_at_price
+            share = inp.quote_size / total_at_price
             return share * inp.market_trade_size
 
         elif model == QueueModel.BACK:
-            # >= covers exact exhaustion: trade that clears the full book fills us.
+            # Our simulated order rests BEHIND the recorded book: the trade
+            # must clear the displayed depth before any contracts reach us.
             if inp.market_trade_size >= inp.book_size_at_price:
-                return inp.quote_size
+                return min(inp.quote_size,
+                           inp.market_trade_size - inp.book_size_at_price)
             return 0.0
 
         raise ValueError(f"Unknown QueueModel: {model}")

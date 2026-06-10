@@ -424,7 +424,20 @@ async def _poll_fills_loop(
     log = logging.getLogger("run_live")
     from src.data.schemas import Fill, Side
 
+    # Seed with the account's existing trade history so startup does not
+    # replay old fills as new ones (which would cancel ladders and fire
+    # live hedge orders for positions closed long ago).
     seen_fill_ids: set[str] = set()
+    started_at = datetime.now(tz=timezone.utc)
+    try:
+        py_client = client._get_py_client()
+        for trade in py_client.get_trades() or []:
+            trade_id = trade.get("id", trade.get("transactionHash", ""))
+            if trade_id:
+                seen_fill_ids.add(trade_id)
+        log.info("Fill poll seeded with %d historical trades", len(seen_fill_ids))
+    except Exception as exc:
+        log.warning("Could not seed fill history (will rely on timestamp cutoff): %s", exc)
 
     while not stop_event.is_set():
         await asyncio.sleep(poll_interval_seconds)
@@ -463,6 +476,10 @@ async def _poll_fills_loop(
                         is_maker=trade.get("maker_order_id") is not None,
                         token_side=token_side,
                     )
+                    # Belt-and-braces: never route fills that predate this
+                    # process, even if history seeding failed.
+                    if fill.timestamp < started_at:
+                        continue
                     # Only route our maker fills — taker fills are the hedge we placed
                     if fill.is_maker:
                         log.info(
@@ -672,6 +689,7 @@ async def main_async(args: argparse.Namespace) -> None:
                         seed_fv_from_recent_trades(loop, cid, yes_token)
                         loops.append(loop)
                         token_to_loop[yes_token] = loop
+                        token_to_loop[no_token] = loop
                         known_condition_ids.add(cid)
                         feed.add_token(yes_token)
                         feed.add_token(no_token)
@@ -693,6 +711,18 @@ async def main_async(args: argparse.Namespace) -> None:
         pass
     finally:
         _thread_stop.set()
+        # Cancel all resting orders BEFORE tearing down the feed — orders left
+        # on the book after exit can fill with no hedging engine running.
+        if args.live:
+            log.info("Cancelling all resting orders across %d markets...", len(loops))
+            for loop in loops:
+                try:
+                    loop._cancel_all()
+                except Exception as exc:
+                    log.error(
+                        "Failed to cancel orders for %s: %s — CHECK THE BOOK MANUALLY",
+                        loop.config.market_id[:40], exc,
+                    )
         feed.stop()
         feed_task.cancel()
         if fill_poll_task:

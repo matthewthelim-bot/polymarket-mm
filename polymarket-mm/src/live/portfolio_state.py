@@ -107,6 +107,25 @@ class PortfolioConstraints:
                     return False
             return True
 
+    def try_open(
+        self,
+        event_key: str,
+        market_id: str,
+        notional: float,
+        days_to_resolution: int,
+    ) -> bool:
+        """Atomically check caps and, if allowed, record the open.
+
+        Unlike can_open() + open_position(), no other thread can sneak an
+        open between the check and the commit. Returns True if the position
+        was recorded, False if a cap blocked it (state unchanged).
+        """
+        with self._lock:
+            if not self.can_open(event_key, market_id, notional, days_to_resolution):
+                return False
+            self.open_position(event_key, market_id, notional, days_to_resolution)
+            return True
+
     # ------------------------------------------------------------------ #
     #  State mutations                                                     #
     # ------------------------------------------------------------------ #

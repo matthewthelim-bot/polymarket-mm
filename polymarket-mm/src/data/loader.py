@@ -104,5 +104,15 @@ class HistoricalDataLoader:
         )
 
     @staticmethod
-    def _parse_ts(ts_str: str) -> datetime:
-        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    def _parse_ts(ts: object) -> datetime:
+        """Parse an ISO-8601 string or numeric epoch timestamp (UTC).
+
+        Numeric epochs appear in some ingest formats; an unsupported type
+        raises ValueError so load_market's malformed-line handler skips the
+        line instead of crashing the whole backtest.
+        """
+        if isinstance(ts, (int, float)):
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        if isinstance(ts, str):
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        raise ValueError(f"Unsupported timestamp type: {type(ts).__name__}")
