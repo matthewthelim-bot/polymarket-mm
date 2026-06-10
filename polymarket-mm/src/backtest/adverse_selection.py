@@ -45,6 +45,11 @@ class AdverseSelectionTracker:
         self.rolling_n = rolling_n
         self._pending: list[_ASEvent] = []
         self._completed: list[_ASEvent] = []
+        # All-time counters for stats() — kept separately so _completed can
+        # be capped at rolling_n instead of growing for the process lifetime.
+        self._total_measured: int = 0
+        self._total_adverse: int = 0
+        self._total_adverse_magnitude: float = 0.0
 
     def on_fill(self, price: float, timestamp: datetime) -> None:
         """Record a Yes buy fill at `price`."""
@@ -64,34 +69,47 @@ class AdverseSelectionTracker:
                 ev.observed_price = price
                 ev.is_adverse = drop > self.adverse_threshold
                 self._completed.append(ev)
+                self._total_measured += 1
+                if ev.is_adverse:
+                    self._total_adverse += 1
+                    self._total_adverse_magnitude += drop
             else:
                 still_pending.append(ev)
         self._pending = still_pending
+        # estimate() only ever reads the last rolling_n — cap the buffer
+        if len(self._completed) > self.rolling_n:
+            del self._completed[: len(self._completed) - self.rolling_n]
 
     def estimate(self) -> float:
         """
         Rolling average adverse magnitude over the last `rolling_n` measured fills.
         Returns 0.0 when no adverse fills are in the window.
+
+        Averaged over ALL fills in the window, not only the adverse ones —
+        one adverse fill among twenty clean fills is a diluted signal, not a
+        full-magnitude suspension trigger.
         """
         recent = self._completed[-self.rolling_n:]
-        adverse = [ev for ev in recent if ev.is_adverse]
-        if not adverse:
+        if not recent:
             return 0.0
-        return sum(ev.fill_price - ev.observed_price for ev in adverse) / len(adverse)
+        adverse_sum = sum(
+            ev.fill_price - ev.observed_price for ev in recent if ev.is_adverse
+        )
+        return adverse_sum / len(recent)
 
     def stats(self) -> dict:
         """Summary statistics for reporting. All counts are all-time totals."""
-        all_adverse = [ev for ev in self._completed if ev.is_adverse]
-        num_measured = len(self._completed)
-        num_adverse = len(all_adverse)
-        as_rate = num_adverse / num_measured if num_measured > 0 else 0.0
+        as_rate = (
+            self._total_adverse / self._total_measured
+            if self._total_measured > 0 else 0.0
+        )
         avg_mag = (
-            sum(ev.fill_price - ev.observed_price for ev in all_adverse) / len(all_adverse)
-            if all_adverse else 0.0
+            self._total_adverse_magnitude / self._total_adverse
+            if self._total_adverse > 0 else 0.0
         )
         return {
-            "num_measured": num_measured,
-            "num_adverse": num_adverse,
+            "num_measured": self._total_measured,
+            "num_adverse": self._total_adverse,
             "as_rate": as_rate,
             "avg_magnitude": avg_mag,
         }

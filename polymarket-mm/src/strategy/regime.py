@@ -56,11 +56,20 @@ class RegimeClassifier:
             return Regime.SUSPENDED
 
         total = inp.inventory.total_contracts()
-        fraction = total / inp.max_inventory_contracts if inp.max_inventory_contracts > 0 else 0.0
+        # abs(): bucket corrections can net total below zero — residual
+        # exposure in either direction must still drive the inventory regimes.
+        exposure = abs(total)
+        # max_inventory_contracts <= 0 is a degenerate config (a typo'd zero
+        # would otherwise silently disable WAREHOUSE/REDUCED forever). Treat
+        # any exposure as fully at-limit instead.
+        if inp.max_inventory_contracts > 0:
+            fraction = exposure / inp.max_inventory_contracts
+        else:
+            fraction = 1.0 if exposure > 0 else 0.0
 
         # 3. Pre-resolution hedge window
         if inp.time_to_resolution_hours <= inp.pre_resolution_hours:
-            if total > 0:
+            if exposure > 0:
                 return Regime.HEDGE_PENDING
 
         # 4. Inventory warehouse (near hard limit)
@@ -72,7 +81,7 @@ class RegimeClassifier:
             return Regime.INVENTORY_REDUCED
 
         # 6. One side filled (small inventory)
-        if total > 0:
+        if exposure > 0:
             return Regime.ONE_SIDE_FILLED
 
         # 7. Normal quoting

@@ -108,11 +108,25 @@ class BufferedMarketWriter:
     def __init__(self, base_dir: Path):
         self._base_dir = base_dir
         self._buffers: dict[str, list[str]] = defaultdict(list)
-        self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+        self._locks: dict[str, threading.Lock] = {}
         self._last_flush: dict[str, float] = defaultdict(float)
         self._total_events: int = 0
         self._market_counts: dict[str, int] = defaultdict(int)
         self._global_lock = threading.Lock()
+
+    def _lock_for(self, condition_id: str) -> threading.Lock:
+        """Per-market lock, created under the global lock.
+
+        defaultdict(threading.Lock) is NOT safe here: two feed threads
+        hitting the same new key concurrently can each construct a distinct
+        Lock and both enter the critical section.
+        """
+        with self._global_lock:
+            lock = self._locks.get(condition_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[condition_id] = lock
+            return lock
 
     def write(self, condition_id: str, event: dict) -> None:
         line = json.dumps(event, separators=(",", ":"))
@@ -120,7 +134,7 @@ class BufferedMarketWriter:
         with self._global_lock:
             self._total_events += 1
             self._market_counts[condition_id] += 1
-        with self._locks[condition_id]:
+        with self._lock_for(condition_id):
             self._buffers[condition_id].append(line)
             n = len(self._buffers[condition_id])
             elapsed = now - self._last_flush[condition_id]
@@ -142,7 +156,7 @@ class BufferedMarketWriter:
     def flush_all(self) -> None:
         """Flush all pending buffers to disk."""
         for condition_id in list(self._buffers.keys()):
-            with self._locks[condition_id]:
+            with self._lock_for(condition_id):
                 self._flush_locked(condition_id)
 
     def _get_path(self, condition_id: str) -> Path:
