@@ -61,33 +61,33 @@ WS_MARKETS_PER_CONNECTION = 50      # empirical server-side throttle
 SATURATION_WARN_THRESHOLD = 45      # warn when a feed pins near the cap
 
 SERIES_FEED_GROUPS: dict[str, list[str]] = {
-    # Rolling 5-minute windows — new market every 5 min per asset
-    "ser-5m": [
-        "btc-up-or-down-5m",
-        "eth-up-or-down-5m",
-        "sol-up-or-down-5m",
-        "xrp-up-or-down-5m",
-    ],
+    # Rolling 5-minute windows, split majors/alts (gauge showed one shared
+    # connection pinned at the cap)
+    "ser-5m-maj": ["btc-up-or-down-5m", "eth-up-or-down-5m"],
+    "ser-5m-alt": ["sol-up-or-down-5m", "xrp-up-or-down-5m"],
     # Rolling 15-minute windows
-    "ser-15m": [
-        "btc-up-or-down-15m",
-        "eth-up-or-down-15m",
-        "sol-up-or-down-15m",
-        "xrp-up-or-down-15m",
-    ],
-    # Daily up/down + weekly strike markets
-    "ser-dw": [
-        "btc-up-or-down-daily",
-        "eth-up-or-down-daily",
+    "ser-15m-maj": ["btc-up-or-down-15m", "eth-up-or-down-15m"],
+    "ser-15m-alt": ["sol-up-or-down-15m", "xrp-up-or-down-15m"],
+    # Daily up/down and weekly strikes on separate connections
+    "ser-daily": ["btc-up-or-down-daily", "eth-up-or-down-daily"],
+    "ser-wk": [
         "btc-multi-strikes-weekly",
         "ethereum-multi-strikes-weekly",
         "xrp-multi-strikes-weekly",
         "solana-multi-strikes-weekly",
     ],
-    # Sports — each gets its own connection (MLB alone has ~16 betting
-    # lines per game x ~15 games/day = the whole cap by itself)
+    # Sports. MLB alone has ~16 betting lines per game x ~15 games/day —
+    # far beyond one connection's cap, so its tokens are sharded across
+    # multiple connections (see SERIES_GROUP_SHARDS).
     "ser-mlb": ["mlb"],
     "ser-ufc": ["ufc"],
+}
+
+# Groups whose market list is split across N connections (token-level
+# sharding within one slug group). Use when a single group has more active
+# markets than one connection's ~50 cap and it can't be split by slug.
+SERIES_GROUP_SHARDS: dict[str, int] = {
+    "ser-mlb": 3,
 }
 
 # Flat list for backwards-compat (fetch_series_markets default)
@@ -298,19 +298,29 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
         for tid in tok_cond:
             token_to_feed[tid] = label
 
-    std_shards = max(1, std_shards)
-    shard_size = (len(markets) + std_shards - 1) // std_shards if markets else 0
-    std_labels = []
-    for i in range(std_shards):
-        chunk = markets[i * shard_size:(i + 1) * shard_size]
-        if chunk:
-            label = f"std-{i + 1}"
-            std_labels.append(label)
-            _register(label, chunk)
+    # group_labels: routing-group name -> feed labels in that group.
+    # The refresh thread round-robins new tokens across a group's labels.
+    group_labels: dict[str, list[str]] = {}
 
-    for label, slugs in SERIES_FEED_GROUPS.items():
+    def _register_group(group: str, mkts: list[dict], shards: int = 1) -> None:
+        """Register a market group, splitting across `shards` connections."""
+        shards = max(1, shards)
+        size = (len(mkts) + shards - 1) // shards if mkts else 0
+        labels = []
+        for i in range(shards):
+            chunk = mkts[i * size:(i + 1) * size]
+            if chunk:
+                label = group if shards == 1 else f"{group}-{i + 1}"
+                _register(label, chunk)
+                labels.append(label)
+        group_labels[group] = labels
+
+    _register_group("std", markets, shards=max(1, std_shards))
+
+    for group, slugs in SERIES_FEED_GROUPS.items():
         group_markets = fetch_series_markets(slugs=slugs)
-        _register(label, group_markets)
+        _register_group(group, group_markets,
+                        shards=SERIES_GROUP_SHARDS.get(group, 1))
 
     logger.info(
         "Feeds: %s",
@@ -368,7 +378,6 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
     feeds: dict[str, BookFeed] = {
         label: BookFeed(tids) for label, tids in feed_tokens.items() if tids
     }
-    std_feeds = [feeds[lbl] for lbl in std_labels if lbl in feeds]
 
     all_feeds = list(feeds.values())
     for feed in all_feeds:
@@ -396,24 +405,22 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
     #    go to their group's feed.
     # ------------------------------------------------------------------
     _refresh_stop = threading.Event()
-    _next_shard = [0]  # round-robin cursor for new standard tokens
+    _group_cursor: dict[str, int] = defaultdict(int)  # round-robin per group
 
-    def _subscribe_new(label: str, tok_cond: dict, tok_side: dict) -> int:
-        """Register tokens not yet known and subscribe them on `label`'s feed."""
+    def _subscribe_new(group: str, tok_cond: dict, tok_side: dict) -> int:
+        """Register unknown tokens, round-robining across the group's feeds."""
+        labels = [lbl for lbl in group_labels.get(group, []) if lbl in feeds]
+        if not labels:
+            return 0
         added = 0
         for tid, cid in tok_cond.items():
             if tid not in token_to_condition:
                 token_to_condition[tid] = cid
                 token_to_side[tid] = tok_side[tid]
-                if label == "std" and std_feeds:
-                    # round-robin across standard shards
-                    shard_idx = _next_shard[0] % len(std_feeds)
-                    std_feeds[shard_idx].add_token(tid)
-                    token_to_feed[tid] = std_labels[shard_idx]
-                    _next_shard[0] += 1
-                elif label in feeds:
-                    feeds[label].add_token(tid)
-                    token_to_feed[tid] = label
+                label = labels[_group_cursor[group] % len(labels)]
+                _group_cursor[group] += 1
+                feeds[label].add_token(tid)
+                token_to_feed[tid] = label
                 added += 1
         return added
 
@@ -426,12 +433,12 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
                 added = _subscribe_new("std", std_tok, std_side)
                 new_q = dict(std_q)
                 counts_str = []
-                for label, slugs in SERIES_FEED_GROUPS.items():
+                for group, slugs in SERIES_FEED_GROUPS.items():
                     grp = fetch_series_markets(slugs=slugs)
                     g_tok, g_side, g_q = build_token_maps(grp)
-                    added += _subscribe_new(label, g_tok, g_side)
+                    added += _subscribe_new(group, g_tok, g_side)
                     new_q.update(g_q)
-                    counts_str.append(f"{label}:{len(grp)}")
+                    counts_str.append(f"{group}:{len(grp)}")
                 for cid, q in new_q.items():
                     if cid not in condition_to_question:
                         condition_to_question[cid] = q
