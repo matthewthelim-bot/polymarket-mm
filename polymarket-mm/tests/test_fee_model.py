@@ -112,3 +112,21 @@ def test_max_flatten_price_is_above_p_fill_for_yes_buy(fm):
     # For a Yes buy at 0.46, the No side ceiling should be just above 0.46
     # and well below 0.54 (= 1 - p_fill). Tight range: [0.47, 0.53]
     assert 0.47 < p_max < 0.53
+
+
+def test_max_flatten_price_zero_fee_linear():
+    """Fee-free markets (geopolitics) must not crash the quadratic solver."""
+    fm = FeeModel()
+    p_max = fm.max_flatten_price(
+        p_fill=0.45, fee_rate=0.0, rebate_fraction=0.0, min_edge_floor=0.005,
+    )
+    # Linear breakeven: 1 - 0.45 - 0.005
+    assert p_max == pytest.approx(0.545)
+
+
+def test_min_flatten_price_for_sell_zero_fee_no_crash():
+    fm = FeeModel()
+    p_min = fm.min_flatten_price_for_sell(
+        p_fill=0.45, fee_rate=0.0, rebate_fraction=0.0, min_edge_floor=0.005,
+    )
+    assert p_min == pytest.approx(1 - 0.45 + 0.005)

@@ -31,10 +31,57 @@ from src.backtest.simulator import BacktestSimulator, SimulatorConfig
 # ---------------------------------------------------------------------------
 # Strategy parameters (mirror live QuoteLoopConfig)
 # ---------------------------------------------------------------------------
+# Fallback fee schedule when the per-market lookup fails. Polymarket fees are
+# PER-CATEGORY (verified against Gamma feeSchedule, June 2026):
+#   crypto 0.07 / rebate 20%, sports 0.03 / 25%, politics-finance-tech 0.04,
+#   economics-culture-weather 0.05 (all 25%), geopolitics fee-free.
+# The fallback is deliberately worst-case (highest fee, lowest rebate).
 FEE_RATE    = 0.07
-REBATE_FRAC = 0.50
+REBATE_FRAC = 0.20
 QUOTE_SIZE  = 100.0   # fallback when a market has no observed trades
 LATENCY_MS  = 50
+
+
+def fetch_fee_schedule(condition_id: str, slug: str = "") -> tuple[float, float]:
+    """Return (taker_fee_rate, maker_rebate_rate) for a market.
+
+    Reads the authoritative Gamma `feeSchedule` (rate, rebateRate, takerOnly)
+    — fees vary by category and some markets (geopolitics) are fee-free.
+    Lookup chain: CLOB /markets/{cid} -> market_slug -> Gamma ?slug=
+    (Gamma's ?condition_id= filter is broken server-side; do not use it).
+    Falls back to the worst-case (FEE_RATE, REBATE_FRAC) on any error.
+    """
+    import json as _json
+    import urllib.request as _ur
+
+    def _get(url):
+        req = _ur.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _ur.urlopen(req, timeout=10) as resp:
+            return _json.loads(resp.read())
+
+    try:
+        if not slug:
+            slug = _get(f"https://clob.polymarket.com/markets/{condition_id}").get(
+                "market_slug", "")
+        if slug:
+            data = _get(f"https://gamma-api.polymarket.com/markets?slug={slug}")
+            if not data:
+                # Gamma's ?slug= excludes closed markets by default — retry
+                # including them (fee schedules persist after close, and most
+                # of the backtest universe is closed short-duration windows).
+                data = _get(
+                    f"https://gamma-api.polymarket.com/markets?slug={slug}&closed=true")
+            m = data[0] if isinstance(data, list) and data else None
+            if m is not None:
+                if not m.get("feesEnabled", False):
+                    return 0.0, 0.0  # genuinely fee-free (e.g. geopolitics)
+                sched = m.get("feeSchedule") or {}
+                rate = float(sched.get("rate", FEE_RATE))
+                rebate = float(sched.get("rebateRate", REBATE_FRAC))
+                return rate, rebate
+    except Exception:
+        pass
+    return FEE_RATE, REBATE_FRAC
 
 # Ladder: levels anchored to best bid/ask, ascending size going deeper.
 LADDER_LEVELS       = 5
@@ -170,13 +217,21 @@ def make_simulator(market_id: str, days_to_resolution: int = 9999,
                    event_key: str = "", portfolio=None,
                    quote_size: Optional[float] = None,
                    iceberg_display_size: float = ICEBERG_DISPLAY_SIZE,
+                   fee_rate: Optional[float] = None,
+                   rebate_frac: Optional[float] = None,
                    ) -> BacktestSimulator:
-    """Build a dual-book BacktestSimulator with the standard live parameters."""
+    """Build a dual-book BacktestSimulator with the standard live parameters.
+
+    fee_rate / rebate_frac: per-market category fees (see fetch_fee_schedule).
+    Defaults to the worst-case module constants when not provided.
+    """
+    fee_rate = FEE_RATE if fee_rate is None else fee_rate
+    rebate_frac = REBATE_FRAC if rebate_frac is None else rebate_frac
     fm = FeeModel()
     meta = MarketMetadata(
         condition_id=market_id, token_id_yes=market_id, token_id_no=market_id,
-        category="unknown", fee_rate=FEE_RATE, fee_exponent=1,
-        rebate_fraction=REBATE_FRAC, sports=False,
+        category="unknown", fee_rate=fee_rate, fee_exponent=1,
+        rebate_fraction=rebate_frac, sports=False,
     )
     skew = SkewConfig(
         skew_tolerance=0.0, skew_edge_premium=0.005,
@@ -187,10 +242,10 @@ def make_simulator(market_id: str, days_to_resolution: int = 9999,
         metadata=meta, fee_model=fm,
         fv_estimator=FairValueEstimator(twap_window_seconds=3600, external_weight=0.0),
         regime_classifier=RegimeClassifier(),
-        hedgeability_assessor=HedgeabilityAssessor(fm, FEE_RATE, REBATE_FRAC, 0.005),
-        quote_engine=QuoteEngine(fm, FEE_RATE, REBATE_FRAC, LADDER_OFFSET, 0.005),
+        hedgeability_assessor=HedgeabilityAssessor(fm, fee_rate, rebate_frac, 0.005),
+        quote_engine=QuoteEngine(fm, fee_rate, rebate_frac, LADDER_OFFSET, 0.005),
         inventory_manager=InventoryManager(market_id, 0.0003),
-        pnl_engine=PnLEngine(fm, FEE_RATE, REBATE_FRAC),
+        pnl_engine=PnLEngine(fm, fee_rate, rebate_frac),
         fill_model=FillModel(FillModelConfig(queue_model=QueueModel.FRONT,
                                              latency_ms=LATENCY_MS)),
         skew_config=skew,

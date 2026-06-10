@@ -107,6 +107,11 @@ class FeeModel:
         rebate = rebate_fraction * fee_rate * p_fill * (1 - p_fill)
         lhs = 1 - p_fill + rebate - min_edge_floor
 
+        if fee_rate <= 0:
+            # Fee-free market (e.g. geopolitics): breakeven is linear,
+            # p_flatten <= 1 - p_fill - min_edge_floor (rebate is 0 too).
+            return max(0.0, min(1.0, lhs))
+
         a = fee_rate
         b = -(1 + fee_rate)
         c = lhs

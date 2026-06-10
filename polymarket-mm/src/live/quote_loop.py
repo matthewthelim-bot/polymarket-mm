@@ -57,9 +57,12 @@ class QuoteLoopConfig:
     no_token_id: str
     condition_id: str
 
-    # Strategy parameters
+    # Strategy parameters — fee_rate/rebate_fraction should be set per market
+    # from Gamma's feeSchedule (fees are PER-CATEGORY: crypto 0.07/20%,
+    # sports 0.03/25%, politics-finance 0.04/25%, geopolitics free).
+    # Defaults are the worst case: highest fee, lowest rebate share.
     fee_rate: float = 0.07
-    rebate_fraction: float = 0.5
+    rebate_fraction: float = 0.20
     half_spread_base: float = 0.030
     min_edge_floor: float = 0.005
     quote_size: float = 100.0

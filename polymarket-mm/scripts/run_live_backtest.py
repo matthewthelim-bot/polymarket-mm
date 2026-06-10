@@ -26,6 +26,7 @@ from src.backtest.live_harness import (
     ICEBERG_DISPLAY_SIZE,
     load_market_events, is_dual_book,
     compute_avg_trade_size, adaptive_quote_size, make_simulator,
+    fetch_fee_schedule,
 )
 
 # --- EC2 collector config ---------------------------------------------------
@@ -142,37 +143,47 @@ def main():
     eligible = [(mid, files) for mid, files in market_files.items() if is_dual_book(files)]
     print(f"Found {len(eligible)} dual-book markets.")
 
-    # Fetch resolution dates + event IDs for all eligible markets
-    print("Fetching resolution dates from Gamma API ...")
-    market_resolution: dict[str, tuple[str, int, str]] = {}  # mid -> (end_date_str, days_left, event_id)
+    # Fetch resolution dates + per-market fee schedules for all eligible markets
+    print("Fetching resolution dates + fee schedules ...")
+    # mid -> (end_date_str, days_left, event_key, fee_rate, rebate_rate)
+    market_resolution: dict[str, tuple[str, int, str, float, float]] = {}
 
-    def _fetch_market_meta(cid: str) -> tuple[str, int, str]:
-        """Returns (end_date_str, days_left, event_key).
+    def _fetch_market_meta(cid: str) -> tuple[str, int, str, float, float]:
+        """Returns (end_date_str, days_left, event_key, fee_rate, rebate_rate).
 
         Uses CLOB REST path lookup — the Gamma ?condition_id= query filter is
         broken server-side (returns an unrelated market), which would silently
-        misclassify short-duration markets as long-term. event_key is the
-        end-date string (markets resolving the same day share an event cap
-        when MAX_EVENT_NOTIONAL > 0; it defaults to 0/disabled).
+        misclassify short-duration markets as long-term. The fee schedule
+        comes from Gamma's per-market feeSchedule (fees are PER-CATEGORY:
+        crypto 0.07/20%, sports 0.03/25%, etc.; geopolitics fee-free).
+        event_key is the end-date string.
         """
         url = f"https://clob.polymarket.com/markets/{cid}"
+        end_date_str, days_left, slug = "unknown", 9999, ""
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 m = json.loads(resp.read())
+            slug = m.get("market_slug", "")
             end_str = m.get("end_date_iso") or ""
             if end_str:
                 end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
                 days_left = max(0, (end_dt - datetime.now(timezone.utc)).days)
                 end_date_str = end_dt.strftime("%Y-%m-%d")
-                return end_date_str, days_left, end_date_str
         except Exception:
             pass
-        return "unknown", 9999, "unknown"
+        fee_rate, rebate_rate = fetch_fee_schedule(cid, slug)
+        return end_date_str, days_left, end_date_str, fee_rate, rebate_rate
 
-    for mid, _ in eligible:
+    for i, (mid, _) in enumerate(eligible, 1):
         market_resolution[mid] = _fetch_market_meta(mid)
-    print(f"  Done ({len(market_resolution)} markets resolved).")
+        if i % 100 == 0:
+            print(f"  {i}/{len(eligible)} ...")
+    fee_counts = defaultdict(int)
+    for _, _, _, fr, rr in market_resolution.values():
+        fee_counts[(fr, rr)] += 1
+    print(f"  Done. Fee schedules: " + ", ".join(
+        f"{n}x rate={fr:.3f}/rebate={rr:.2f}" for (fr, rr), n in sorted(fee_counts.items())))
 
     # Shared portfolio constraints — enforced across all simulators sequentially.
     # NOTE: The backtest runs markets one at a time (not interleaved), so the portfolio
@@ -196,7 +207,7 @@ def main():
 
     results = []   # (mid, SimulationResult, avg_trade_size, quote_size_used)
     for i, (mid, files) in enumerate(eligible, 1):
-        end_date_str, days_left, event_key = market_resolution[mid]
+        end_date_str, days_left, event_key, fee_rate, rebate_rate = market_resolution[mid]
         events = load_market_events(files)
         avg_ts = compute_avg_trade_size(events)
         qs     = adaptive_quote_size(avg_ts)
@@ -206,6 +217,8 @@ def main():
             event_key=event_key,
             portfolio=portfolio,
             quote_size=qs,
+            fee_rate=fee_rate,
+            rebate_frac=rebate_rate,
         )
         r = sim.run(events)
         results.append((mid, r, avg_ts, qs))
@@ -369,7 +382,7 @@ def main():
     # Only this counts against the LT budget; short-duration positions don't.
     lt_open_positions = 0
     for mid, r, _, _ in results:
-        days_left = market_resolution.get(mid, ("", 9999, ""))[1]
+        days_left = market_resolution.get(mid, ("", 9999, "", 0.0, 0.0))[1]
         if days_left > 30:
             longs_closed  = r.num_ask_arb_cycles - r.num_shorts_opened
             shorts_closed = r.num_bid_arb_cycles - r.num_longs_opened
@@ -491,7 +504,7 @@ def main():
 
         # Reuse already-fetched resolution data (market_resolution dict from above)
         # Unpack 3-tuple: (end_date_str, days_left, event_key) — drop event_key for display
-        end_dates = {mid: market_resolution.get(mid, ("unknown", 9999, "unknown"))[:2]
+        end_dates = {mid: market_resolution.get(mid, ("unknown", 9999, "unknown", 0.0, 0.0))[:2]
                      for mid in open_by_market}
 
         # Print per-market table (sorted by days_left)

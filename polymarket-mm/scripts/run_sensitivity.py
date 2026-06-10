@@ -17,6 +17,7 @@ from src.live.portfolio_state import PortfolioConstraints
 from src.backtest.live_harness import (
     load_market_events, is_dual_book,
     compute_avg_trade_size, adaptive_quote_size, make_simulator,
+    fetch_fee_schedule,
 )
 
 ROOT_DIR     = Path(__file__).resolve().parent.parent
@@ -47,10 +48,12 @@ def fetch_meta(cid):
             end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
             days_left = max(0, (end_dt - datetime.now(timezone.utc)).days)
             end_date_str = end_dt.strftime("%Y-%m-%d")
-            return end_date_str, days_left, end_date_str
+            fee_rate, rebate = fetch_fee_schedule(cid, m.get("market_slug", ""))
+            return end_date_str, days_left, end_date_str, fee_rate, rebate
     except Exception:
         pass
-    return "unknown", 9999, "unknown"
+    fee_rate, rebate = fetch_fee_schedule(cid)
+    return "unknown", 9999, "unknown", fee_rate, rebate
 
 
 def run_scenario(label, total_capital, lt_frac, eligible, market_resolution, period_days):
@@ -62,12 +65,13 @@ def run_scenario(label, total_capital, lt_frac, eligible, market_resolution, per
     )
     results = []
     for mid, files in eligible:
-        end_date_str, days_left, event_key = market_resolution[mid]
+        end_date_str, days_left, event_key, fee_rate, rebate_rate = market_resolution[mid]
         events = load_market_events(files)
         avg_ts = compute_avg_trade_size(events)
         qs     = adaptive_quote_size(avg_ts)
         sim    = make_simulator(mid, days_to_resolution=days_left,
-                                event_key=event_key, portfolio=portfolio, quote_size=qs)
+                                event_key=event_key, portfolio=portfolio, quote_size=qs,
+                                fee_rate=fee_rate, rebate_frac=rebate_rate)
         r      = sim.run(events)
         results.append((mid, r, avg_ts, qs))
 

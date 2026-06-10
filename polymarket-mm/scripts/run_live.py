@@ -46,6 +46,7 @@ from src.live.credentials import load_credentials, CredentialError
 from src.live.clob_client import ClobClient
 from src.live.book_feed import BookFeed
 from src.live.portfolio_state import PortfolioConstraints
+from src.backtest.live_harness import fetch_fee_schedule
 from src.live.quote_loop import QuoteLoop, QuoteLoopConfig
 from src.strategy.fair_value import TradeObservation
 
@@ -224,15 +225,21 @@ def build_quote_loop(
     portfolio: PortfolioConstraints | None = None,
     days_to_resolution: int = 9999,
     event_key: str = "",
+    fee_rate: float | None = None,
+    rebate_fraction: float | None = None,
 ) -> QuoteLoop:
-    """Construct a QuoteLoop for one market from CLI args."""
+    """Construct a QuoteLoop for one market from CLI args.
+
+    fee_rate / rebate_fraction: per-market category fees from Gamma's
+    feeSchedule. None falls back to the CLI flags (--fee-rate / --rebate).
+    """
     config = QuoteLoopConfig(
         market_id=title,
         yes_token_id=yes_token,
         no_token_id=no_token,
         condition_id=condition_id,
-        fee_rate=args.fee_rate,
-        rebate_fraction=args.rebate,
+        fee_rate=args.fee_rate if fee_rate is None else fee_rate,
+        rebate_fraction=args.rebate if rebate_fraction is None else rebate_fraction,
         half_spread_base=args.half_spread,
         min_edge_floor=args.min_edge,
         quote_size=args.quote_size,
@@ -562,9 +569,11 @@ async def main_async(args: argparse.Namespace) -> None:
             event_key, days_left = resolution_from_universe_entry(entry)
             if args.max_event_notional > 0:
                 event_key = fetch_event_key(condition_id, entry.get("slug", "")) or event_key
+            mkt_fee, mkt_rebate = fetch_fee_schedule(condition_id, entry.get("slug", ""))
             loop = build_quote_loop(
                 yes_token, no_token, condition_id, title, client, fee_model, args,
                 portfolio=portfolio, days_to_resolution=days_left, event_key=event_key,
+                fee_rate=mkt_fee, rebate_fraction=mkt_rebate,
             )
             loops.append(loop)
             token_ids.extend([yes_token, no_token])
@@ -581,9 +590,11 @@ async def main_async(args: argparse.Namespace) -> None:
             event_key, days_left = fetch_market_resolution(condition_id)
             if args.max_event_notional > 0:
                 event_key = fetch_event_key(condition_id) or event_key
+            mkt_fee, mkt_rebate = fetch_fee_schedule(condition_id)
             loop = build_quote_loop(
                 yes_token, no_token, condition_id, title, client, fee_model, args,
                 portfolio=portfolio, days_to_resolution=days_left, event_key=event_key,
+                fee_rate=mkt_fee, rebate_fraction=mkt_rebate,
             )
             loops.append(loop)
             token_ids.extend([yes_token, no_token])
@@ -682,9 +693,11 @@ async def main_async(args: argparse.Namespace) -> None:
                         ev_key, d_left = resolution_from_universe_entry(entry)
                         if args.max_event_notional > 0:
                             ev_key = fetch_event_key(cid, entry.get("slug", "")) or ev_key
+                        w_fee, w_rebate = fetch_fee_schedule(cid, entry.get("slug", ""))
                         loop = build_quote_loop(
                             yes_token, no_token, cid, question, client, fee_model, args,
                             portfolio=portfolio, days_to_resolution=d_left, event_key=ev_key,
+                            fee_rate=w_fee, rebate_fraction=w_rebate,
                         )
                         seed_fv_from_recent_trades(loop, cid, yes_token)
                         loops.append(loop)
@@ -758,8 +771,12 @@ def main():
     )
     parser.add_argument("--quote-size", type=float, default=100.0)
     parser.add_argument("--half-spread", type=float, default=0.030)
-    parser.add_argument("--fee-rate", type=float, default=0.07)
-    parser.add_argument("--rebate", type=float, default=0.5)
+    parser.add_argument("--fee-rate", type=float, default=0.07,
+                        help="Fallback taker fee rate if per-market lookup fails "
+                             "(real rates per category from Gamma feeSchedule)")
+    parser.add_argument("--rebate", type=float, default=0.20,
+                        help="Fallback maker rebate share if per-market lookup fails "
+                             "(real: 20%% crypto / 25%% others, from Gamma feeSchedule)")
     parser.add_argument("--min-edge", type=float, default=0.005)
     parser.add_argument("--max-open-positions", type=int, default=4,
                         help="Pause new quotes when this many unhedged fills exist (default 4)")
