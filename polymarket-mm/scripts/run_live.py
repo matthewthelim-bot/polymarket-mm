@@ -164,6 +164,38 @@ def fetch_market_resolution(condition_id: str) -> tuple[str, int]:
     return "unknown", 9999
 
 
+def fetch_event_key(condition_id: str, slug: str = "") -> str:
+    """Return the true Gamma event ID for a market, or "" on failure.
+
+    Used only when --max-event-notional > 0 so the per-event cap groups
+    genuinely related sub-markets (e.g. the ~16 betting lines of one MLB
+    game) instead of the date-based fallback grouping.
+
+    Lookup chain: CLOB /markets/{cid} -> market_slug -> Gamma ?slug= ->
+    events[0].id. (Gamma's ?condition_id= filter is broken, hence the hop.)
+    """
+    import urllib.request as _ur, json as _json
+
+    def _get(url):
+        req = _ur.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _ur.urlopen(req, timeout=8) as resp:
+            return _json.loads(resp.read())
+
+    try:
+        if not slug:
+            slug = _get(f"https://clob.polymarket.com/markets/{condition_id}").get(
+                "market_slug", "")
+        if slug:
+            data = _get(f"https://gamma-api.polymarket.com/markets?slug={slug}")
+            m = data[0] if isinstance(data, list) and data else {}
+            events = m.get("events") or []
+            if events and events[0].get("id"):
+                return str(events[0]["id"])
+    except Exception:
+        pass
+    return ""
+
+
 def resolution_from_universe_entry(entry: dict) -> tuple[str, int]:
     """Like fetch_market_resolution() but reads the universe entry's stored
     end_date — no network call. Recomputes days-left from today since the
@@ -511,6 +543,8 @@ async def main_async(args: argparse.Namespace) -> None:
             condition_id = entry["condition_id"]
             title = entry["question"][:80]
             event_key, days_left = resolution_from_universe_entry(entry)
+            if args.max_event_notional > 0:
+                event_key = fetch_event_key(condition_id, entry.get("slug", "")) or event_key
             loop = build_quote_loop(
                 yes_token, no_token, condition_id, title, client, fee_model, args,
                 portfolio=portfolio, days_to_resolution=days_left, event_key=event_key,
@@ -528,6 +562,8 @@ async def main_async(args: argparse.Namespace) -> None:
                 continue
             yes_token, no_token, condition_id, title = result
             event_key, days_left = fetch_market_resolution(condition_id)
+            if args.max_event_notional > 0:
+                event_key = fetch_event_key(condition_id) or event_key
             loop = build_quote_loop(
                 yes_token, no_token, condition_id, title, client, fee_model, args,
                 portfolio=portfolio, days_to_resolution=days_left, event_key=event_key,
@@ -627,6 +663,8 @@ async def main_async(args: argparse.Namespace) -> None:
                         question = entry["question"][:80]
                         log_w.info("New market detected: %s", question[:60])
                         ev_key, d_left = resolution_from_universe_entry(entry)
+                        if args.max_event_notional > 0:
+                            ev_key = fetch_event_key(cid, entry.get("slug", "")) or ev_key
                         loop = build_quote_loop(
                             yes_token, no_token, cid, question, client, fee_model, args,
                             portfolio=portfolio, days_to_resolution=d_left, event_key=ev_key,
@@ -707,10 +745,11 @@ def main():
     parser.add_argument("--max-long-term-fraction", type=float, default=0.80,
                         help="Max fraction of capital in >30-day positions (default 0.80)")
     parser.add_argument("--max-event-notional", type=float, default=0.0,
-                        help="Max USDC per event group (default 0=disabled). "
-                             "CAUTION: events are currently grouped by resolution "
-                             "DATE, so this caps ALL markets resolving the same "
-                             "day collectively — only enable if that is intended.")
+                        help="Max USDC per Gamma event group (default 0=disabled). "
+                             "When enabled, real event IDs are fetched per market "
+                             "so correlated sub-markets (e.g. all betting lines of "
+                             "one MLB game) share one cap; falls back to "
+                             "resolution-date grouping if the lookup fails.")
     args = parser.parse_args()
 
     setup_logging(args.verbose)

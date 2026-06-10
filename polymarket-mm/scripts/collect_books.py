@@ -249,7 +249,7 @@ def fetch_series_markets(slugs: list[str] | None = None) -> list[dict]:
 
 
 def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0,
-                  refresh_interval: int = 300) -> None:
+                  refresh_interval: int = 300, std_shards: int = 3) -> None:
     base_dir = Path(out_dir)
     writer = BufferedMarketWriter(base_dir)
 
@@ -271,33 +271,46 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
     )
 
     # Build separate token maps so each feed gets its own WS connection.
-    # The Polymarket WS throttles to ~50 active markets per connection regardless
-    # of subscription size. Three dedicated connections prevent any group from
-    # starving the others:
-    #   - std_feed:  standard markets (6k+ tokens, top 50 by global volume)
-    #   - hf_feed:   5m/15m BTC/ETH/SOL/XRP  (very active per-second)
-    #   - lf_feed:   daily, weekly, MLB, UFC  (lower per-second, need their own slot)
-    std_tok_cond, std_tok_side, std_cond_q = build_token_maps(markets)
-    hf_tok_cond,  hf_tok_side,  hf_cond_q  = build_token_maps(hf_markets)
-    lf_tok_cond,  lf_tok_side,  lf_cond_q  = build_token_maps(lf_markets)
+    # The Polymarket WS pushes events for only ~50 active markets per
+    # connection regardless of subscription size, so coverage scales with the
+    # number of connections:
+    #   - std shards: standard markets split into volume tiers (Gamma returns
+    #     them sorted by volume24hr desc, so contiguous chunks = tiers; each
+    #     shard captures its own top-50 instead of one global top-50)
+    #   - hf_feed:    5m/15m BTC/ETH/SOL/XRP  (very active per-second)
+    #   - lf_feed:    daily, weekly, MLB, UFC  (lower per-second rate)
+    std_shards = max(1, std_shards)
+    shard_size = (len(markets) + std_shards - 1) // std_shards if markets else 0
+    std_shard_maps = []
+    for i in range(std_shards):
+        chunk = markets[i * shard_size:(i + 1) * shard_size]
+        if chunk:
+            std_shard_maps.append(build_token_maps(chunk))
+    hf_tok_cond, hf_tok_side, hf_cond_q = build_token_maps(hf_markets)
+    lf_tok_cond, lf_tok_side, lf_cond_q = build_token_maps(lf_markets)
 
     # Shared mutable maps (written by refresh thread, read by callbacks)
-    token_to_condition: dict[str, str] = {**std_tok_cond, **hf_tok_cond, **lf_tok_cond}
-    token_to_side: dict[str, str]      = {**std_tok_side, **hf_tok_side, **lf_tok_side}
-    condition_to_question: dict[str, str] = {**std_cond_q, **hf_cond_q, **lf_cond_q}
+    token_to_condition: dict[str, str] = {**hf_tok_cond, **lf_tok_cond}
+    token_to_side: dict[str, str]      = {**hf_tok_side, **lf_tok_side}
+    condition_to_question: dict[str, str] = {**hf_cond_q, **lf_cond_q}
+    for tok_cond, tok_side, cond_q in std_shard_maps:
+        token_to_condition.update(tok_cond)
+        token_to_side.update(tok_side)
+        condition_to_question.update(cond_q)
 
-    std_token_ids = list(std_tok_cond.keys())
-    hf_token_ids  = list(hf_tok_cond.keys())
-    lf_token_ids  = list(lf_tok_cond.keys())
+    std_shard_token_ids = [list(m[0].keys()) for m in std_shard_maps]
+    hf_token_ids = list(hf_tok_cond.keys())
+    lf_token_ids = list(lf_tok_cond.keys())
 
     logger.info(
-        "Token maps: %d std (%d mkts) | %d hf-series (%d mkts) | %d lf-series (%d mkts)",
-        len(std_token_ids), len(markets),
-        len(hf_token_ids),  len(hf_markets),
-        len(lf_token_ids),  len(lf_markets),
+        "Token maps: %s std tokens in %d shards (%d mkts) | %d hf-series (%d mkts) | %d lf-series (%d mkts)",
+        "+".join(str(len(t)) for t in std_shard_token_ids) or "0",
+        len(std_shard_token_ids), len(markets),
+        len(hf_token_ids), len(hf_markets),
+        len(lf_token_ids), len(lf_markets),
     )
 
-    if not any([std_token_ids, hf_token_ids, lf_token_ids]):
+    if not any([std_shard_token_ids, hf_token_ids, lf_token_ids]):
         logger.error("No token IDs found — cannot subscribe. Exiting.")
         sys.exit(1)
 
@@ -336,30 +349,30 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
         writer.write(condition_id, event)
 
     # ------------------------------------------------------------------
-    # 3. Start THREE BookFeeds — each group gets its own WS connection.
+    # 3. Start the BookFeeds — N standard shards + hf + lf, one WS each.
     # ------------------------------------------------------------------
-    std_feed = BookFeed(std_token_ids) if std_token_ids else None
-    hf_feed  = BookFeed(hf_token_ids)  if hf_token_ids  else None
-    lf_feed  = BookFeed(lf_token_ids)  if lf_token_ids  else None
+    std_feeds = [BookFeed(tids) for tids in std_shard_token_ids if tids]
+    hf_feed = BookFeed(hf_token_ids) if hf_token_ids else None
+    lf_feed = BookFeed(lf_token_ids) if lf_token_ids else None
 
-    for feed in (std_feed, hf_feed, lf_feed):
-        if feed:
-            feed.on_any_book_update(on_book_update)
-            feed.on_any_trade(on_trade)
+    all_feeds = [f for f in (*std_feeds, hf_feed, lf_feed) if f is not None]
+    for feed in all_feeds:
+        feed.on_any_book_update(on_book_update)
+        feed.on_any_trade(on_trade)
 
     # Graceful shutdown on Ctrl+C or SIGTERM
     def _shutdown(signum, frame):
         logger.info("Shutdown signal received — stopping feeds...")
-        for feed in (std_feed, hf_feed, lf_feed):
-            if feed:
-                feed.stop()
+        for feed in all_feeds:
+            feed.stop()
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    if std_feed:
-        std_feed.start()
-        logger.info("Standard feed started:    %d tokens", len(std_token_ids))
+    for i, feed in enumerate(std_feeds):
+        feed.start()
+        logger.info("Standard shard %d/%d started: %d tokens",
+                    i + 1, len(std_feeds), len(std_shard_token_ids[i]))
     if hf_feed:
         hf_feed.start()
         logger.info("High-freq series feed:    %d tokens (5m/15m BTC/ETH/SOL/XRP)", len(hf_token_ids))
@@ -371,9 +384,11 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
     # ------------------------------------------------------------------
     # 4. Market refresh thread — discovers new series windows + any new
     #    standard markets that come online after startup.
-    #    New standard tokens go to std_feed; new series tokens to ser_feed.
+    #    New standard tokens round-robin across std shards; series tokens
+    #    go to their dedicated feed.
     # ------------------------------------------------------------------
     _refresh_stop = threading.Event()
+    _next_shard = [0]  # round-robin cursor for new standard tokens
 
     def _refresh_markets():
         """Periodically re-scan Gamma for new markets and subscribe to the right feed."""
@@ -390,8 +405,9 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
                     if tid not in token_to_condition:
                         token_to_condition[tid] = cid
                         token_to_side[tid]      = new_std_side[tid]
-                        if std_feed:
-                            std_feed.add_token(tid)
+                        if std_feeds:
+                            std_feeds[_next_shard[0] % len(std_feeds)].add_token(tid)
+                            _next_shard[0] += 1
                         added_std += 1
                 for tid, cid in new_hf_tok.items():
                     if tid not in token_to_condition:
@@ -439,7 +455,7 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
     last_stats = start_time
 
     def _any_feed_running() -> bool:
-        return any(f is not None and f.is_running() for f in (std_feed, hf_feed, lf_feed))
+        return any(f.is_running() for f in all_feeds)
 
     try:
         while _any_feed_running():
@@ -450,9 +466,8 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
                 _print_stats(writer, condition_to_question, start_time)
     except KeyboardInterrupt:
         # SIGINT already handled above, but just in case
-        for feed in (std_feed, hf_feed, lf_feed):
-            if feed:
-                feed.stop()
+        for feed in all_feeds:
+            feed.stop()
 
     # ------------------------------------------------------------------
     # 6. Flush & final stats
@@ -535,6 +550,15 @@ def main():
         metavar="SECS",
         help="Seconds between market re-scans to pick up new/rolling series windows (default: 300)",
     )
+    parser.add_argument(
+        "--std-shards",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Number of WS connections for standard markets. The WS pushes "
+             "events for only ~50 active markets per connection, so more "
+             "shards = more coverage (default: 3)",
+    )
     args = parser.parse_args()
 
     run_collector(
@@ -542,6 +566,7 @@ def main():
         stats_interval=args.stats_interval,
         min_volume=args.min_volume,
         refresh_interval=args.refresh_interval,
+        std_shards=args.std_shards,
     )
 
 

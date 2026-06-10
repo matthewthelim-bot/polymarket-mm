@@ -13,28 +13,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.data.schemas import OrderBook, PriceLevel, Fill, Side, MarketMetadata
-from src.fee_model import FeeModel
-from src.strategy.fair_value import FairValueEstimator
-from src.strategy.regime import RegimeClassifier
-from src.strategy.hedgeability import HedgeabilityAssessor, SkewConfig
-from src.strategy.quote_engine import QuoteEngine
-from src.strategy.inventory import InventoryManager
-from src.pnl import PnLEngine
-from src.backtest.fill_model import FillModel, FillModelConfig, QueueModel
-from src.backtest.simulator import BacktestSimulator, SimulatorConfig
 from src.live.portfolio_state import PortfolioConstraints
+from src.backtest.live_harness import (
+    load_market_events, is_dual_book,
+    compute_avg_trade_size, adaptive_quote_size, make_simulator,
+)
 
 ROOT_DIR     = Path(__file__).resolve().parent.parent
 LIVE_DIR     = ROOT_DIR / "data" / "live"
-FEE_RATE     = 0.07
-REBATE_FRAC  = 0.50
-LATENCY_MS   = 50
-LADDER_LEVELS      = 5
-LADDER_OFFSET      = 0.030
-LADDER_TICK        = 0.010
-LADDER_SIZE_RATIOS = [1.0, 1.5, 2.0, 2.5, 3.0]
-PRICE_TOLERANCE    = 0.010
 MAX_MARKET_NOTIONAL = 2_000.0
 
 SCENARIOS = [
@@ -45,142 +31,26 @@ SCENARIOS = [
 ]
 
 
-# ── helpers (copied from run_live_backtest.py) ────────────────────────────────
-
-def parse_ts(s):
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-
-def load_market_events(files):
-    events = []
-    seen = set()
-    for f in files:
-        for line in f.read_text(encoding="utf-8", errors="ignore").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                raw = json.loads(line)
-            except Exception:
-                continue
-            et  = raw.get("event_type")
-            ts  = parse_ts(raw.get("timestamp", ""))
-            if ts is None:
-                continue
-            if et == "book":
-                bids = [PriceLevel(float(b["price"]), float(b["size"])) for b in raw.get("bids", [])]
-                asks = [PriceLevel(float(a["price"]), float(a["size"])) for a in raw.get("asks", [])]
-                events.append((ts, OrderBook(
-                    market_id=raw.get("market_id", ""), timestamp=ts,
-                    bids=bids, asks=asks, token_side=raw.get("token_side", ""),
-                )))
-            elif et == "trade":
-                fid = raw.get("fill_id", "")
-                if fid and fid in seen:
-                    continue
-                if fid:
-                    seen.add(fid)
-                upper = raw.get("side", "").upper()
-                token_side = upper if upper in ("YES", "NO") else ""
-                side = Side.BUY if raw.get("side", "").lower() == "buy" else Side.SELL
-                try:
-                    events.append((ts, Fill(
-                        fill_id=fid, market_id=raw.get("market_id", ""),
-                        side=side, price=float(raw["price"]), size=float(raw["size"]),
-                        timestamp=ts, is_maker=bool(raw.get("is_maker", False)),
-                        token_side=token_side,
-                    )))
-                except Exception:
-                    pass
-    events.sort(key=lambda x: x[0])
-    return [e for _, e in events]
-
-
-def compute_avg_trade_size(events):
-    sizes = [e.size for e in events if isinstance(e, Fill) and e.size > 0]
-    return statistics.mean(sizes) if sizes else 100.0
-
-
-def adaptive_quote_size(avg):
-    return max(5.0, min(500.0, round(avg / 2)))
-
-
-def is_dual_book(files):
-    has_yes = has_no = has_trade = False
-    for f in files:
-        for line in f.read_text(encoding="utf-8", errors="ignore").splitlines():
-            try:
-                ev = json.loads(line.strip())
-                ts = ev.get("token_side", "")
-                et = ev.get("event_type", "")
-                if et == "book" and ts == "YES": has_yes = True
-                if et == "book" and ts == "NO":  has_no  = True
-                if et == "trade":                has_trade = True
-            except Exception:
-                pass
-        if has_yes and has_no and has_trade:
-            break
-    return has_yes and has_no and has_trade
-
-
 def fetch_meta(cid):
-    url = f"https://gamma-api.polymarket.com/markets?condition_id={cid}"
+    """(end_date_str, days_left, event_key) via CLOB REST.
+
+    Gamma's ?condition_id= filter is broken server-side (returns an unrelated
+    market) — do not revert to it. event_key falls back to the end-date string.
+    """
+    url = f"https://clob.polymarket.com/markets/{cid}"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        m = data[0] if isinstance(data, list) and data else {}
-        end_str = m.get("end_date_iso") or m.get("endDate") or m.get("end_date") or ""
-        events_list = m.get("events") or []
-        event_id = str(events_list[0]["id"]) if events_list else ""
+            m = json.loads(resp.read())
+        end_str = m.get("end_date_iso") or ""
         if end_str:
             end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
-            days_left = (end_dt - datetime.now(timezone.utc)).days
+            days_left = max(0, (end_dt - datetime.now(timezone.utc)).days)
             end_date_str = end_dt.strftime("%Y-%m-%d")
-            event_key = event_id if event_id else end_date_str
-            return end_date_str, days_left, event_key
+            return end_date_str, days_left, end_date_str
     except Exception:
         pass
     return "unknown", 9999, "unknown"
-
-
-def make_sim(market_id, days_to_resolution, event_key, portfolio, quote_size):
-    fm   = FeeModel()
-    meta = MarketMetadata(
-        condition_id=market_id, token_id_yes=market_id, token_id_no=market_id,
-        category="unknown", fee_rate=FEE_RATE, fee_exponent=1,
-        rebate_fraction=REBATE_FRAC, sports=False,
-    )
-    skew = SkewConfig(skew_tolerance=0.0, skew_edge_premium=0.005,
-                      skew_hard_limit=0, skew_capital_charge_multiplier=3.0,
-                      max_skew_notional=0.0, current_skew_notional=0.0)
-    fv   = FairValueEstimator(twap_window_seconds=3600, external_weight=0.0)
-    reg  = RegimeClassifier()
-    ha   = HedgeabilityAssessor(fm, FEE_RATE, REBATE_FRAC, 0.005)
-    qe   = QuoteEngine(fm, FEE_RATE, REBATE_FRAC, LADDER_OFFSET, 0.005)
-    inv  = InventoryManager(market_id, 0.0003)
-    pnl  = PnLEngine(fm, FEE_RATE, REBATE_FRAC)
-    fm2  = FillModel(FillModelConfig(queue_model=QueueModel.FRONT, latency_ms=LATENCY_MS))
-    return BacktestSimulator(
-        metadata=meta, fee_model=fm,
-        fv_estimator=fv, regime_classifier=reg,
-        hedgeability_assessor=ha, quote_engine=qe,
-        inventory_manager=inv, pnl_engine=pnl,
-        fill_model=fm2, skew_config=skew,
-        config=SimulatorConfig(
-            start_capital=50000.0, quote_size=quote_size,
-            time_to_resolution_hours=720.0,
-            ladder_levels=LADDER_LEVELS, ladder_offset_from_best=LADDER_OFFSET,
-            ladder_tick_spacing=LADDER_TICK, ladder_size_ratios=LADDER_SIZE_RATIOS,
-            price_tolerance=PRICE_TOLERANCE, iceberg_display_size=0.0,
-            days_to_resolution=days_to_resolution, event_key=event_key,
-            market_id=market_id,
-        ),
-        portfolio=portfolio,
-    )
 
 
 def run_scenario(label, total_capital, lt_frac, eligible, market_resolution, period_days):
@@ -196,7 +66,8 @@ def run_scenario(label, total_capital, lt_frac, eligible, market_resolution, per
         events = load_market_events(files)
         avg_ts = compute_avg_trade_size(events)
         qs     = adaptive_quote_size(avg_ts)
-        sim    = make_sim(mid, days_left, event_key, portfolio, qs)
+        sim    = make_simulator(mid, days_to_resolution=days_left,
+                                event_key=event_key, portfolio=portfolio, quote_size=qs)
         r      = sim.run(events)
         results.append((mid, r, avg_ts, qs))
 
