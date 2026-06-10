@@ -76,18 +76,31 @@ class HedgeabilityAssessor:
             Only the size at each specific level is stripped, preventing over-stripping
             across a multi-level book.
         """
-        p_max = self.fee_model.max_flatten_price(
-            p_fill=quote_price,
-            fee_rate=self.fee_rate,
-            rebate_fraction=self.rebate_fraction,
-            min_edge_floor=self.min_edge_floor,
-        )
+        # The profitable-flatten bound differs by side:
+        #   BUY  fill → hedge by BUYING the opposing side → price CEILING
+        #   SELL fill → hedge by SELLING the opposing side → price FLOOR
+        # (1 - p_fill - fees - edge vs 1 - p_fill + fees + edge — reusing the
+        # buy ceiling for sells counts loss-making bids as hedgeable.)
+        if quote_side == Side.BUY:
+            p_threshold = self.fee_model.max_flatten_price(
+                p_fill=quote_price,
+                fee_rate=self.fee_rate,
+                rebate_fraction=self.rebate_fraction,
+                min_edge_floor=self.min_edge_floor,
+            )
+        else:
+            p_threshold = self.fee_model.min_flatten_price_for_sell(
+                p_fill=quote_price,
+                fee_rate=self.fee_rate,
+                rebate_fraction=self.rebate_fraction,
+                min_edge_floor=self.min_edge_floor,
+            )
 
         net_depth = self._net_opposing_depth(
             book=book,
             own_order_ids=own_order_ids,
             own_order_sizes=own_order_sizes or {},
-            max_price=p_max,
+            threshold_price=p_threshold,
             side=quote_side,
         )
 
@@ -105,7 +118,7 @@ class HedgeabilityAssessor:
             unhedgeable_size=unhedgeable,
             skew_accepted=skew_accepted,
             skew_rejected=skew_rejected,
-            max_flatten_price=p_max,
+            max_flatten_price=p_threshold,
         )
 
     def _net_opposing_depth(
@@ -113,10 +126,14 @@ class HedgeabilityAssessor:
         book: OrderBook,
         own_order_ids: set[str],
         own_order_sizes: dict[float, float],  # keyed by price level
-        max_price: float,
+        threshold_price: float,
         side: Side,
     ) -> float:
-        """Sum opposing-side depth at prices <= max_price, stripping own orders.
+        """Sum opposing-side depth within the profitable price range,
+        stripping own orders.
+
+        threshold_price is a CEILING for BUY hedges (asks <= it count) and a
+        FLOOR for SELL hedges (bids >= it count).
 
         own_order_sizes is keyed by price (rounded to 6 dp) so only the own-order
         size at each specific price level is subtracted — not the total own-order
@@ -126,9 +143,9 @@ class HedgeabilityAssessor:
         levels = book.asks if side == Side.BUY else book.bids
         total = 0.0
         for level in levels:
-            if side == Side.BUY and level.price > max_price:
+            if side == Side.BUY and level.price > threshold_price:
                 break  # asks sorted ascending; stop when too expensive
-            if side == Side.SELL and level.price < max_price:
+            if side == Side.SELL and level.price < threshold_price:
                 break  # bids sorted descending; stop when too cheap
             own_at_level = (own_order_sizes or {}).get(round(level.price, 6), 0.0)
             net = max(0.0, level.size - own_at_level)

@@ -117,3 +117,51 @@ class FeeModel:
 
         p_max = (-b - math.sqrt(discriminant)) / (2 * a)
         return max(0.0, min(1.0, p_max))
+
+    def min_flatten_price_for_sell(
+        self,
+        p_fill: float,
+        fee_rate: float,
+        rebate_fraction: float,
+        min_edge_floor: float,
+    ) -> float:
+        """
+        Minimum price at which SELLING the opposing side still yields net
+        positive edge, given a passive sell fill at p_fill.
+
+        This is the sell-side mirror of max_flatten_price and a different
+        bound — reusing the buy ceiling as a sell floor counts loss-making
+        bids as hedgeable (the gap between the two bounds is ~2*(fee+edge)).
+
+        Breakeven condition (proceeds side):
+            (p_fill + p_flatten - 1) + rebate - taker_fee(p_flatten) - min_edge_floor >= 0
+
+        Substituting taker_fee = fee_rate * p * (1 - p):
+            fee_rate * p^2 + (1 - fee_rate) * p + C >= 0
+        where:
+            rebate = rebate_fraction * fee_rate * p_fill * (1 - p_fill)
+            C      = p_fill - 1 + rebate - min_edge_floor
+
+        The parabola opens upward, so prices at or above the larger root are
+        profitable. The result is intentionally NOT clamped to 1.0: a value
+        above 1.0 means no valid book price can hedge profitably, and depth
+        scans comparing `price >= threshold` then correctly find nothing.
+        """
+        rebate = rebate_fraction * fee_rate * p_fill * (1 - p_fill)
+        c = p_fill - 1 + rebate - min_edge_floor
+
+        if fee_rate <= 0:
+            # Linear degenerate case: p + C >= 0
+            return max(0.0, -c)
+
+        a = fee_rate
+        b = 1 - fee_rate
+
+        discriminant = b ** 2 - 4 * a * c
+        if discriminant < 0:
+            # Quadratic never reaches zero from below — with a > 0 this means
+            # always positive, i.e. any price hedges profitably.
+            return 0.0
+
+        p_min = (-b + math.sqrt(discriminant)) / (2 * a)
+        return max(0.0, p_min)

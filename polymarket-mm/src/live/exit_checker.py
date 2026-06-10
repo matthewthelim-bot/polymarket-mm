@@ -79,6 +79,8 @@ class ExitChecker:
         no_book: OrderBook,
         entry_price: float,
         quote_size: float,
+        own_yes_bid_sizes: dict[float, float] | None = None,
+        own_no_ask_sizes: dict[float, float] | None = None,
     ) -> ExitViability:
         """
         Assess whether we can safely enter and exit a position of `quote_size`.
@@ -88,15 +90,25 @@ class ExitChecker:
             no_book: Current live L2 book for the NO token.
             entry_price: The bid price we intend to post (the fill price if hit).
             quote_size: The number of contracts we want to quote.
+            own_yes_bid_sizes: Our own resting YES-bid size per price level
+                (price rounded to 6 dp -> size). MUST be passed when we are
+                actively quoting this market — our own bids are not exit
+                liquidity, and a market whose only "exit depth" is our own
+                order must fail this check. Scanners running before any
+                orders exist may omit.
+            own_no_ask_sizes: Same for our resting NO asks.
 
         Returns:
             ExitViability with sizes we can actually exit and whether it's viable.
         """
+        own_yes = own_yes_bid_sizes or {}
+        own_no = own_no_ask_sizes or {}
+
         # --- YES exit: sell back into YES bid side ---
         # We accept bids at prices >= entry_price * (1 - max_loss_fraction)
         yes_min_price = entry_price * (1.0 - self._max_loss_fraction)
         yes_exit_size = sum(
-            lvl.size
+            max(0.0, lvl.size - own_yes.get(round(lvl.price, 6), 0.0))
             for lvl in yes_book.bids
             if lvl.price >= yes_min_price
         )
@@ -113,7 +125,7 @@ class ExitChecker:
             min_edge_floor=self._min_edge_floor,
         )
         no_exit_size = sum(
-            lvl.size
+            max(0.0, lvl.size - own_no.get(round(lvl.price, 6), 0.0))
             for lvl in no_book.asks
             if lvl.price <= max_flatten_price
         )

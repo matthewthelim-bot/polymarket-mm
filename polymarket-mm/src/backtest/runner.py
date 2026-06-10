@@ -69,8 +69,18 @@ class BacktestRunner:
     loads event data, and runs the simulation.
     """
 
-    def __init__(self, config: RunConfig):
+    def __init__(self, config: RunConfig, portfolio=None):
+        """
+        Args:
+            config: RunConfig for this market.
+            portfolio: Optional shared PortfolioConstraints. When None
+                (the default), this single-market run is UNCAPPED — no
+                long-term/per-event/per-market portfolio limits apply.
+                Multi-market harnesses (live_harness.make_simulator) wire
+                a shared instance; pass one here for comparable results.
+        """
         self.config = config
+        self.portfolio = portfolio
 
     def run(self) -> SimulationResult:
         """
@@ -166,6 +176,7 @@ class BacktestRunner:
                 quote_staleness_threshold=cfg.quote_staleness_threshold,
                 max_concurrent_positions=cfg.max_concurrent_positions,
             ),
+            portfolio=self.portfolio,
         )
 
         # 6. Load events from data

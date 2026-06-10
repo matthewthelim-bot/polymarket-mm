@@ -158,6 +158,7 @@ class QuoteLoopStats:
     takers_filled: int = 0
     maker_maker_cycles: int = 0
     open_positions: int = 0
+    unroutable_fills: int = 0    # fills moved to the dead-letter list (reconcile manually)
     total_pnl: float = 0.0
     errors: int = 0
 
@@ -174,6 +175,10 @@ class QuoteLoop:
         clob_client: Authenticated ClobClient (or unauthenticated for dry_run).
         fee_model: Shared FeeModel instance.
     """
+
+    # Book updates an unroutable (unknown_*) fill may wait before being moved
+    # to the dead-letter list. At one update per second this is ~5 minutes.
+    UNROUTABLE_MAX_ATTEMPTS = 300
 
     def __init__(
         self,
@@ -231,6 +236,12 @@ class QuoteLoop:
 
         # Fills where the taker hedge hasn't been sent yet
         self._open_positions: list[_OpenPosition] = []
+        # Dead-letter list: unroutable fills (unknown_*) that exhausted their
+        # retry budget. They hold REAL exposure but cannot be auto-hedged
+        # (token/side unknown) — parked here so they stop blocking
+        # max_open_positions, surfaced via stats and error logs for manual
+        # reconciliation against the account's position page.
+        self._unroutable_fills: list[_OpenPosition] = []
 
         # Notional exposure tracking per direction.
         # Incremented on each completed bid-arb (long) or ask-arb (short) cycle.
@@ -591,7 +602,22 @@ class QuoteLoop:
                 get_price = lambda b: b.bids[0].price if b and b.bids else None
                 is_profitable = lambda mp, hp: mp + hp > 1.0
             else:
-                still_open.append(pos)
+                # Unroutable (unknown_*) — can never match a hedge route.
+                # Give it a bounded retry budget in case a later code path
+                # learns to route it, then park it in the dead-letter list so
+                # it stops counting against max_open_positions forever.
+                if pos.attempts >= self.UNROUTABLE_MAX_ATTEMPTS:
+                    self._unroutable_fills.append(pos)
+                    self.stats.unroutable_fills += 1
+                    logger.error(
+                        "[%s] UNROUTABLE FILL parked after %d attempts: %s "
+                        "price=%.3f size=%.1f — REAL exposure, RECONCILE "
+                        "MANUALLY against the account position page",
+                        self.config.market_id, pos.attempts, pos.fill_type,
+                        pos.maker_price, pos.size,
+                    )
+                else:
+                    still_open.append(pos)
                 continue
 
             hedge_price = get_price(book)

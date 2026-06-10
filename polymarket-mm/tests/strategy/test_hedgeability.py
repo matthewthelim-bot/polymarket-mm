@@ -219,3 +219,90 @@ def test_skew_hard_limit_blocks_when_contracts_at_limit():
     # Hard limit hit — no new skew accepted
     assert result.skew_accepted == pytest.approx(0.0)
     assert result.skew_rejected == pytest.approx(100.0)
+
+
+# ---------------------------------------------------------------------------
+# Sell-side hedge threshold (min_flatten_price_for_sell)
+# ---------------------------------------------------------------------------
+# Selling the opposing side is profitable only when
+#   p_fill + p_flatten - 1 + rebate - taker_fee(p_flatten) - edge >= 0
+# i.e. p_flatten must sit ABOVE a floor (~1 - p_fill + fees + edge), not below
+# the buy-side ceiling (~1 - p_fill - fees - edge). The gap between the two
+# bounds is ~2*(fee + edge) of loss-making prices.
+
+def test_min_flatten_price_for_sell_above_buy_ceiling():
+    fm = FeeModel()
+    kw = dict(p_fill=0.5, fee_rate=0.07, rebate_fraction=0.5, min_edge_floor=0.005)
+    floor = fm.min_flatten_price_for_sell(**kw)
+    ceiling = fm.max_flatten_price(**kw)
+    # The sell floor must sit strictly above the buy ceiling (fee+edge gap)
+    assert floor > ceiling + 0.02
+
+
+def test_min_flatten_price_for_sell_breakeven_exact():
+    fm = FeeModel()
+    p_fill, fee_rate, rebate_frac, edge = 0.5, 0.07, 0.5, 0.005
+    floor = fm.min_flatten_price_for_sell(
+        p_fill=p_fill, fee_rate=fee_rate,
+        rebate_fraction=rebate_frac, min_edge_floor=edge,
+    )
+    # Verify the root: net edge at the floor is exactly zero
+    rebate = rebate_frac * fee_rate * p_fill * (1 - p_fill)
+    taker_fee = fee_rate * floor * (1 - floor)
+    net = (p_fill + floor - 1) + rebate - taker_fee - edge
+    assert net == pytest.approx(0.0, abs=1e-9)
+
+
+def test_min_flatten_price_for_sell_zero_fee_linear():
+    fm = FeeModel()
+    floor = fm.min_flatten_price_for_sell(
+        p_fill=0.6, fee_rate=0.0, rebate_fraction=0.5, min_edge_floor=0.01,
+    )
+    # No fees, no rebate: p >= 1 - 0.6 + 0.01
+    assert floor == pytest.approx(0.41)
+
+
+def test_sell_assess_excludes_bids_in_loss_gap():
+    """Bids between the buy ceiling and the sell floor must NOT count."""
+    assessor = make_assessor()
+    fm = FeeModel()
+    # Parameters must match make_assessor (fee_rate=0.04, rebate_fraction=0.20)
+    floor = fm.min_flatten_price_for_sell(
+        p_fill=0.5, fee_rate=0.04, rebate_fraction=0.20, min_edge_floor=0.005,
+    )
+    # One bid just below the floor (loss-making), one just above (profitable)
+    book = make_book(asks=[], bids=[(floor + 0.01, 60.0), (floor - 0.01, 40.0)])
+    result = assessor.assess(
+        quote_side=Side.SELL,
+        quote_price=0.5,
+        quote_size=100.0,
+        book=book,
+        own_order_ids=set(),
+        skew_config=NO_SKEW,
+    )
+    # Only the 60 contracts above the floor are hedgeable
+    assert result.hedgeable_size == pytest.approx(60.0)
+    assert result.unhedgeable_size == pytest.approx(40.0)
+    assert result.max_flatten_price == pytest.approx(floor)
+
+
+def test_sell_assess_old_bound_would_have_passed():
+    """Regression guard: a bid above the (wrong) buy ceiling but below the
+    (correct) sell floor is unhedgeable."""
+    assessor = make_assessor()
+    fm = FeeModel()
+    kw = dict(p_fill=0.5, fee_rate=0.04, rebate_fraction=0.20, min_edge_floor=0.005)
+    ceiling = fm.max_flatten_price(**kw)
+    floor = fm.min_flatten_price_for_sell(**kw)
+    mid_gap = (ceiling + floor) / 2  # inside the loss-making gap
+    book = make_book(asks=[], bids=[(mid_gap, 100.0)])
+    result = assessor.assess(
+        quote_side=Side.SELL,
+        quote_price=0.5,
+        quote_size=100.0,
+        book=book,
+        own_order_ids=set(),
+        skew_config=NO_SKEW,
+    )
+    assert result.hedgeable_size == pytest.approx(0.0)
+    assert result.unhedgeable_size == pytest.approx(100.0)
