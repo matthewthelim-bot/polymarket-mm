@@ -1085,19 +1085,22 @@ class QuoteLoop:
             fee_rate=self.config.fee_rate,
         )
         notional = (maker_price + taker_price) * size
+        # NOTE: by the time we're here, both legs have executed — the position
+        # is real. Portfolio caps are enforced BEFORE quoting (see the
+        # can_open() probes in _check_inventory_caps). Here we only record
+        # reality; if a cap was exceeded anyway (race between fill and quote
+        # suppression), log it loudly but never drop the accounting.
         if fill_type in ("yes_bid", "no_bid"):
             gross = (1.0 - maker_price - taker_price) * size
-            # Bid-arb opens a long — check portfolio caps before recording.
             if self._portfolio is not None and not self._portfolio.can_open(
                 self.config.event_key, self.config.market_id,
                 notional, self.config.days_to_resolution
             ):
-                logger.info(
-                    "[%s] CYCLE %s BLOCKED by portfolio cap",
+                logger.warning(
+                    "[%s] CYCLE %s exceeded portfolio cap — position recorded "
+                    "anyway (caps enforce at quote time, not fill time)",
                     self.config.market_id, fill_type,
                 )
-                # Don't track the position — treat as if fill was skipped.
-                return
             self._long_notional += notional
             if self._portfolio is not None:
                 self._portfolio.open_position(
@@ -1121,11 +1124,11 @@ class QuoteLoop:
                     self.config.event_key, self.config.market_id,
                     notional, self.config.days_to_resolution
                 ):
-                    logger.info(
-                        "[%s] CYCLE %s BLOCKED by portfolio cap",
+                    logger.warning(
+                        "[%s] CYCLE %s exceeded portfolio cap — position "
+                        "recorded anyway (caps enforce at quote time)",
                         self.config.market_id, fill_type,
                     )
-                    return
                 self._short_notional += notional
                 if self._portfolio is not None:
                     self._portfolio.open_position(

@@ -838,6 +838,18 @@ class BacktestSimulator:
         Entry fees are recorded immediately; round-trip PnL is only finalised on close.
         Positions not closed during the simulation are settled at $1.00 in run().
         """
+        # Portfolio cap check FIRST, before any counters/fees are recorded —
+        # a blocked cycle models "we wouldn't have been quoting", so it must
+        # leave zero trace in fee/rebate/cycle accounting.
+        if not self._open_shorts and self._portfolio is not None:
+            if not self._portfolio.can_open(
+                self.config.event_key, self.config.market_id,
+                (maker_price + taker_price) * size,
+                self.config.days_to_resolution,
+            ):
+                self._result.num_portfolio_blocked += 1
+                return
+
         maker_rebate = self.fee_model.maker_rebate(
             size=size, price=maker_price,
             fee_rate=self.meta.fee_rate,
@@ -890,18 +902,10 @@ class BacktestSimulator:
                 short.size -= close_size
                 self._open_shorts.insert(0, short)
         else:
-            # Open a new long — check portfolio caps first
+            # Open a new long (portfolio caps already checked at function top)
             yes_price = maker_price if maker_token == "YES" else taker_price
             no_price  = taker_price if maker_token == "YES" else maker_price
             open_notional = (yes_price + no_price) * size
-            if self._portfolio is not None and not self._portfolio.can_open(
-                self.config.event_key, self.config.market_id,
-                open_notional, self.config.days_to_resolution
-            ):
-                # Portfolio cap hit — undo the cycle counter and skip
-                self._result.num_bid_arb_cycles -= 1
-                self._result.num_portfolio_blocked += 1
-                return
             pos = _OpenPosition(
                 direction="long",
                 entry_yes=yes_price,
@@ -940,6 +944,17 @@ class BacktestSimulator:
           A) Open longs exist → close the oldest long (round-trip completed).
           B) No open longs → open a new short position.
         """
+        # Portfolio cap check FIRST, before any counters/fees are recorded
+        # (mirrors _record_bid_arb_cycle — blocked must leave zero trace).
+        if not self._open_longs and self._portfolio is not None:
+            if not self._portfolio.can_open(
+                self.config.event_key, self.config.market_id,
+                (maker_price + taker_price) * size,
+                self.config.days_to_resolution,
+            ):
+                self._result.num_portfolio_blocked += 1
+                return
+
         maker_rebate = self.fee_model.maker_rebate(
             size=size, price=maker_price,
             fee_rate=self.meta.fee_rate,
@@ -992,18 +1007,10 @@ class BacktestSimulator:
                 long.size -= close_size
                 self._open_longs.insert(0, long)
         else:
-            # Open a new short — check portfolio caps first
+            # Open a new short (portfolio caps already checked at function top)
             yes_price = maker_price if maker_token == "YES" else taker_price
             no_price  = taker_price if maker_token == "YES" else maker_price
             open_notional = (yes_price + no_price) * size
-            if self._portfolio is not None and not self._portfolio.can_open(
-                self.config.event_key, self.config.market_id,
-                open_notional, self.config.days_to_resolution
-            ):
-                # Portfolio cap hit — undo the cycle counter and skip
-                self._result.num_ask_arb_cycles -= 1
-                self._result.num_portfolio_blocked += 1
-                return
             pos = _OpenPosition(
                 direction="short",
                 entry_yes=yes_price,

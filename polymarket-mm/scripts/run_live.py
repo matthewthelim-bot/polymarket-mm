@@ -45,6 +45,7 @@ from src.fee_model import FeeModel
 from src.live.credentials import load_credentials, CredentialError
 from src.live.clob_client import ClobClient
 from src.live.book_feed import BookFeed
+from src.live.portfolio_state import PortfolioConstraints
 from src.live.quote_loop import QuoteLoop, QuoteLoopConfig
 from src.strategy.fair_value import TradeObservation
 
@@ -136,6 +137,50 @@ def resolve_market_tokens(
     return yes_token, no_token, condition_id, title
 
 
+def fetch_market_resolution(condition_id: str) -> tuple[str, int]:
+    """Return (end_date_str, days_to_resolution) for a market.
+
+    Uses the CLOB REST API path lookup. The Gamma /markets?condition_id=
+    query filter is broken server-side (ignores the filter and returns an
+    unrelated market), so it must not be used here.
+
+    The end-date string doubles as the event_key for PortfolioConstraints,
+    grouping markets that resolve on the same day. Returns ("unknown", 9999)
+    on any error so the caps degrade gracefully (unknown = treated long-term).
+    """
+    import urllib.request as _ur, json as _json
+    url = f"https://clob.polymarket.com/markets/{condition_id}"
+    try:
+        req = _ur.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _ur.urlopen(req, timeout=8) as resp:
+            m = _json.loads(resp.read())
+        end_str = m.get("end_date_iso") or ""
+        if end_str:
+            end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+            days_left = (end_dt - datetime.now(timezone.utc)).days
+            return end_dt.strftime("%Y-%m-%d"), max(0, days_left)
+    except Exception:
+        pass
+    return "unknown", 9999
+
+
+def resolution_from_universe_entry(entry: dict) -> tuple[str, int]:
+    """Like fetch_market_resolution() but reads the universe entry's stored
+    end_date — no network call. Recomputes days-left from today since the
+    stored days_to_resolution goes stale between universe rebuilds."""
+    end_str = entry.get("end_date") or ""
+    if end_str:
+        try:
+            end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            days_left = (end_dt - datetime.now(timezone.utc)).days
+            return end_dt.strftime("%Y-%m-%d"), max(0, days_left)
+        except ValueError:
+            pass
+    return fetch_market_resolution(entry.get("condition_id", ""))
+
+
 def build_quote_loop(
     yes_token: str,
     no_token: str,
@@ -144,6 +189,9 @@ def build_quote_loop(
     client: ClobClient,
     fee_model: FeeModel,
     args: argparse.Namespace,
+    portfolio: PortfolioConstraints | None = None,
+    days_to_resolution: int = 9999,
+    event_key: str = "",
 ) -> QuoteLoop:
     """Construct a QuoteLoop for one market from CLI args."""
     config = QuoteLoopConfig(
@@ -165,8 +213,10 @@ def build_quote_loop(
         adverse_selection_threshold=0.012,
         daily_capital_charge_rate=0.0003,
         dry_run=not args.live,
+        days_to_resolution=days_to_resolution,
+        event_key=event_key,
     )
-    return QuoteLoop(config=config, clob_client=client, fee_model=fee_model)
+    return QuoteLoop(config=config, clob_client=client, fee_model=fee_model, portfolio=portfolio)
 
 
 def seed_fv_from_recent_trades(
@@ -413,6 +463,20 @@ async def main_async(args: argparse.Namespace) -> None:
 
     fee_model = FeeModel()
 
+    # Shared portfolio constraints (enforced across all active QuoteLoops)
+    portfolio = PortfolioConstraints(
+        total_capital=getattr(args, "total_capital", 10_000.0),
+        max_long_term_fraction=getattr(args, "max_long_term_fraction", 0.80),
+        max_event_notional=getattr(args, "max_event_notional", 3_000.0),
+    )
+    log.info(
+        "Portfolio caps: long-term <=%.0f%% of $%.0f (<=$%.0f), event <=$%.0f",
+        portfolio.max_long_term_fraction * 100,
+        portfolio.total_capital,
+        portfolio.max_long_term_notional,
+        portfolio.max_event_notional,
+    )
+
     # Discover markets
     if args.universe:
         entries = load_active_from_universe(Path(args.universe))
@@ -446,7 +510,11 @@ async def main_async(args: argparse.Namespace) -> None:
             no_token = entry["no_token"]
             condition_id = entry["condition_id"]
             title = entry["question"][:80]
-            loop = build_quote_loop(yes_token, no_token, condition_id, title, client, fee_model, args)
+            event_key, days_left = resolution_from_universe_entry(entry)
+            loop = build_quote_loop(
+                yes_token, no_token, condition_id, title, client, fee_model, args,
+                portfolio=portfolio, days_to_resolution=days_left, event_key=event_key,
+            )
             loops.append(loop)
             token_ids.extend([yes_token, no_token])
             time.sleep(0.05)
@@ -459,7 +527,11 @@ async def main_async(args: argparse.Namespace) -> None:
                 log.warning("Skipping unresolvable market: %s", path.stem[:40])
                 continue
             yes_token, no_token, condition_id, title = result
-            loop = build_quote_loop(yes_token, no_token, condition_id, title, client, fee_model, args)
+            event_key, days_left = fetch_market_resolution(condition_id)
+            loop = build_quote_loop(
+                yes_token, no_token, condition_id, title, client, fee_model, args,
+                portfolio=portfolio, days_to_resolution=days_left, event_key=event_key,
+            )
             loops.append(loop)
             token_ids.extend([yes_token, no_token])
             time.sleep(0.1)
@@ -554,7 +626,11 @@ async def main_async(args: argparse.Namespace) -> None:
                         no_token = entry["no_token"]
                         question = entry["question"][:80]
                         log_w.info("New market detected: %s", question[:60])
-                        loop = build_quote_loop(yes_token, no_token, cid, question, client, fee_model, args)
+                        ev_key, d_left = resolution_from_universe_entry(entry)
+                        loop = build_quote_loop(
+                            yes_token, no_token, cid, question, client, fee_model, args,
+                            portfolio=portfolio, days_to_resolution=d_left, event_key=ev_key,
+                        )
                         seed_fv_from_recent_trades(loop, cid, yes_token)
                         loops.append(loop)
                         token_to_loop[yes_token] = loop
@@ -626,6 +702,15 @@ def main():
     parser.add_argument("--order-ttl", type=float, default=300.0,
                         help="Seconds before a resting order is cancelled and re-quoted (default 300)")
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--total-capital", type=float, default=10_000.0,
+                        help="Total wallet capital in USDC (default 10000)")
+    parser.add_argument("--max-long-term-fraction", type=float, default=0.80,
+                        help="Max fraction of capital in >30-day positions (default 0.80)")
+    parser.add_argument("--max-event-notional", type=float, default=0.0,
+                        help="Max USDC per event group (default 0=disabled). "
+                             "CAUTION: events are currently grouped by resolution "
+                             "DATE, so this caps ALL markets resolving the same "
+                             "day collectively — only enable if that is intended.")
     args = parser.parse_args()
 
     setup_logging(args.verbose)
