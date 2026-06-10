@@ -91,9 +91,10 @@ SERIES_FEED_GROUPS: dict[str, list[str]] = {
 # sharding within one slug group). Use when a single group has more active
 # markets than one connection's ~50 cap and it can't be split by slug.
 SERIES_GROUP_SHARDS: dict[str, int] = {
-    "ser-mlb": 5,
-    "ser-ufc": 2,
-    "ser-wk": 2,
+    "ser-mlb": 7,   # ~283 active betting lines on game days
+    "ser-ufc": 3,
+    "ser-wk": 2,    # still pins, but weekly-strike books are synthetic
+                    # negRisk liquidity — low maker-taker value, accepted gap
 }
 
 # Flat list for backwards-compat (fetch_series_markets default)
