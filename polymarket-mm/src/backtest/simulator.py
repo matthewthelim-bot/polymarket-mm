@@ -162,6 +162,10 @@ class SimulationResult:
     holding_times_seconds: list = field(default_factory=list)  # seconds held per round trip
     max_concurrent_open: int = 0           # peak number of open positions simultaneously
     total_capital_consumed: float = 0.0    # sum of all entry notionals (capital deployed)
+    # Trading volume — every executed arb cycle trades `size` contracts on
+    # EACH leg (maker + taker). Resolution settlements are not trades.
+    total_contracts_traded: float = 0.0    # contract count across both legs
+    total_traded_notional: float = 0.0     # USDC notional across both legs
 
     def total_pnl(self) -> float:
         return self.total_spread_pnl + self.total_skew_pnl
@@ -1034,6 +1038,10 @@ class BacktestSimulator:
         # Book fees/rebates only on what actually executed
         self._result.total_rebates_received += rebate_pc * executed
         self._result.total_fees_paid += fee_pc * executed
+        # Volume: `executed` contracts on the maker leg + the same on the
+        # taker hedge leg; notional = price paid/received on both legs.
+        self._result.total_contracts_traded += 2 * executed
+        self._result.total_traded_notional += (maker_price + taker_price) * executed
         if open_direction == "long":
             self._result.num_bid_arb_cycles += 1
         else:

@@ -230,6 +230,8 @@ def main():
     total_roundtrip_pnl= sum(r.round_trip_pnl             for _, r, _, _ in results)
     total_res_pnl      = sum(r.resolution_pnl             for _, r, _, _ in results)
     total_capital      = sum(r.total_capital_consumed     for _, r, _, _ in results)
+    total_contracts    = sum(r.total_contracts_traded      for _, r, _, _ in results)
+    total_volume       = sum(r.total_traded_notional       for _, r, _, _ in results)
     peak_concurrent    = max((r.max_concurrent_open for _, r, _, _ in results), default=0)
     all_cycle_pnl      = [p for _, r, _, _ in results for p in r.per_cycle_pnl]
     all_rt_pnl         = [p for _, r, _, _ in results for p in r.per_roundtrip_pnl]
@@ -374,6 +376,8 @@ def main():
             lt_open_positions += (max(0, r.num_longs_opened - longs_closed)
                                   + max(0, r.num_shorts_opened - shorts_closed))
     lt_locked = lt_open_positions * avg_notional
+    print(f"  Trading volume      ${total_volume:>8,.0f}  USDC across both legs  "
+          f"(${total_volume / period_days:,.0f}/day, {total_contracts:,.0f} contracts)")
     print(f"  Cumulative deployed ${total_capital:>8,.0f}  USDC across {total_positions} opens (recycled capital re-counted)")
     print(f"  Peak concurrent     ${peak_locked:>8,.0f}  USDC max locked at once"
           + (f"  ({peak_locked_at:%m-%d %H:%M} UTC)" if peak_locked_at else "")
