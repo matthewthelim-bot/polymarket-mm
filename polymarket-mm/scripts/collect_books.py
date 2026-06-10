@@ -61,14 +61,18 @@ WS_MARKETS_PER_CONNECTION = 50      # empirical server-side throttle
 SATURATION_WARN_THRESHOLD = 45      # warn when a feed pins near the cap
 
 SERIES_FEED_GROUPS: dict[str, list[str]] = {
-    # Rolling 5-minute windows, split majors/alts (gauge showed one shared
-    # connection pinned at the cap)
-    "ser-5m-maj": ["btc-up-or-down-5m", "eth-up-or-down-5m"],
-    "ser-5m-alt": ["sol-up-or-down-5m", "xrp-up-or-down-5m"],
-    # Rolling 15-minute windows
-    "ser-15m-maj": ["btc-up-or-down-15m", "eth-up-or-down-15m"],
-    "ser-15m-alt": ["sol-up-or-down-15m", "xrp-up-or-down-15m"],
-    # Daily up/down and weekly strikes on separate connections
+    # Rolling 5-minute windows — one connection per asset (gauge showed
+    # maj/alt pairs still pinned at the cap)
+    "ser-5m-btc": ["btc-up-or-down-5m"],
+    "ser-5m-eth": ["eth-up-or-down-5m"],
+    "ser-5m-sol": ["sol-up-or-down-5m"],
+    "ser-5m-xrp": ["xrp-up-or-down-5m"],
+    # Rolling 15-minute windows — same per-asset split
+    "ser-15m-btc": ["btc-up-or-down-15m"],
+    "ser-15m-eth": ["eth-up-or-down-15m"],
+    "ser-15m-sol": ["sol-up-or-down-15m"],
+    "ser-15m-xrp": ["xrp-up-or-down-15m"],
+    # Daily up/down (only ~4 markets exist — gauge reads ~4/50, no shard needed)
     "ser-daily": ["btc-up-or-down-daily", "eth-up-or-down-daily"],
     "ser-wk": [
         "btc-multi-strikes-weekly",
@@ -87,7 +91,9 @@ SERIES_FEED_GROUPS: dict[str, list[str]] = {
 # sharding within one slug group). Use when a single group has more active
 # markets than one connection's ~50 cap and it can't be split by slug.
 SERIES_GROUP_SHARDS: dict[str, int] = {
-    "ser-mlb": 3,
+    "ser-mlb": 5,
+    "ser-ufc": 2,
+    "ser-wk": 2,
 }
 
 # Flat list for backwards-compat (fetch_series_markets default)
