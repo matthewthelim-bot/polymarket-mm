@@ -144,6 +144,12 @@ class SimulationResult:
     num_ask_arb_cycles: int = 0            # completed ask-side arb cycles
     num_portfolio_blocked: int = 0         # arb opens skipped due to portfolio caps
     fills_by_level: list = field(default_factory=list)  # fill count per ladder level (index = level)
+    # Per-position capital intervals: (opened_at, closed_at, notional).
+    # closed_at is None for positions still open at the end of the data —
+    # they release capital at the market's resolution time (caller resolves).
+    # Enables peak-CONCURRENT-capital computation across markets, which is
+    # what actually binds against the wallet (unlike cumulative deployment).
+    position_intervals: list = field(default_factory=list)
 
     # Round-trip position tracking
     num_longs_opened: int = 0              # bid-arb entries
@@ -326,6 +332,10 @@ class BacktestSimulator:
         )
 
         # Settle unclosed positions at $1.00 (resolution)
+        for pos in self._open_longs + self._open_shorts:
+            self._result.position_intervals.append(
+                (pos.opened_at, None, (pos.entry_yes + pos.entry_no) * pos.size)
+            )
         for pos in self._open_longs:
             # Bought YES+NO at entry_yes+entry_no; resolves to $1.00
             gross = (1.0 - pos.entry_yes - pos.entry_no) * pos.size
@@ -961,6 +971,9 @@ class BacktestSimulator:
                 pass
 
             close_notional = (pos.entry_yes + pos.entry_no) * close_size
+            self._result.position_intervals.append(
+                (pos.opened_at, timestamp, close_notional)
+            )
             if open_direction == "long":
                 self._short_notional = max(0.0, self._short_notional - close_notional)
             else:

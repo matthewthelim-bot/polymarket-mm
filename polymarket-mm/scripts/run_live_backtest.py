@@ -255,6 +255,47 @@ def main():
     )
 
     # ------------------------------------------------------------------ #
+    #  Peak CONCURRENT capital — the number that actually binds vs the    #
+    #  wallet. Open intervals release capital at close time; positions    #
+    #  still open at data end release at the market's resolution date     #
+    #  (so a 5m window that resolved mid-window hands capital back the    #
+    #  same day instead of counting as "locked" forever).                 #
+    # ------------------------------------------------------------------ #
+    from datetime import timedelta
+    cap_events = []          # (time, +/- notional)
+    window_end = datetime.now(timezone.utc)
+    still_locked_at_end = 0.0
+    for mid, r, _, _ in results:
+        end_date_str = market_resolution.get(mid, ("unknown",))[0]
+        resolution_ts = None
+        if end_date_str not in ("", "unknown"):
+            try:
+                # Release at end of resolution day UTC (conservative upper bound)
+                resolution_ts = datetime.fromisoformat(end_date_str).replace(
+                    tzinfo=timezone.utc) + timedelta(days=1)
+            except ValueError:
+                pass
+        for opened_at, closed_at, notional in r.position_intervals:
+            if opened_at is None:
+                continue
+            if opened_at.tzinfo is None:
+                opened_at = opened_at.replace(tzinfo=timezone.utc)
+            release = closed_at if closed_at is not None else resolution_ts
+            if release is not None and release.tzinfo is None:
+                release = release.replace(tzinfo=timezone.utc)
+            cap_events.append((opened_at, +notional))
+            if release is not None and release <= window_end:
+                cap_events.append((release, -notional))
+            else:
+                still_locked_at_end += notional
+    cap_events.sort(key=lambda e: e[0])
+    peak_locked, running, peak_locked_at = 0.0, 0.0, None
+    for ts_e, delta in cap_events:
+        running += delta
+        if running > peak_locked:
+            peak_locked, peak_locked_at = running, ts_e
+
+    # ------------------------------------------------------------------ #
     #  Derived summary metrics                                            #
     # ------------------------------------------------------------------ #
     import math
@@ -272,11 +313,11 @@ def main():
     net_open        = net_longs_open + net_shorts_open
     capital_at_resolution = net_open * avg_notional
 
-    # Return on capital uses capital actually locked at end of run (most meaningful for
-    # a position-accumulating strategy where capital builds up until resolution).
-    # The old "peak_concurrent × avg_notional" was a per-market metric (misleading).
+    # Return on capital uses PEAK CONCURRENT locked capital — the true
+    # binding constraint vs the wallet. Cumulative deployment re-counts the
+    # same recycled dollars; locked-at-end ignores intra-window resolutions.
     lt_budget       = TOTAL_CAPITAL * MAX_LONG_TERM_FRACTION  # the portfolio cap ceiling
-    roc             = (total_pnl / capital_at_resolution * 100) if capital_at_resolution else 0
+    roc             = (total_pnl / peak_locked * 100) if peak_locked else 0
 
     # Sharpe ratio (annualised, cycle-frequency method, no risk-free rate)
     #
@@ -313,8 +354,9 @@ def main():
           f"({longs_closed_by_arb} ask-arbs closed existing longs)")
     print(f"  Round-trips         {total_roundtrips:>6}  "
           f"(= {longs_closed_by_arb} + {shorts_closed_by_arb})")
-    print(f"  Open at end         {net_open:>6}  "
-          f"({net_longs_open} longs + {net_shorts_open} shorts  ~${capital_at_resolution:,.0f} locked until resolution)")
+    print(f"  Not arb-closed      {net_open:>6}  "
+          f"({net_longs_open} longs + {net_shorts_open} shorts — settle at each "
+          f"market's resolution; most resolved IN-window, see capital lines)")
     if total_portfolio_blocked:
         print(f"  Portfolio blocked   {total_portfolio_blocked:>6}  "
               f"(opens skipped: long-term cap or event cap hit)")
@@ -332,14 +374,18 @@ def main():
             lt_open_positions += (max(0, r.num_longs_opened - longs_closed)
                                   + max(0, r.num_shorts_opened - shorts_closed))
     lt_locked = lt_open_positions * avg_notional
-    print(f"  Capital at end      ${capital_at_resolution:>8,.0f}  USDC locked in {net_open} open positions")
+    print(f"  Cumulative deployed ${total_capital:>8,.0f}  USDC across {total_positions} opens (recycled capital re-counted)")
+    print(f"  Peak concurrent     ${peak_locked:>8,.0f}  USDC max locked at once"
+          + (f"  ({peak_locked_at:%m-%d %H:%M} UTC)" if peak_locked_at else "")
+          + f"  [{peak_locked / TOTAL_CAPITAL * 100:.0f}% of wallet]")
+    print(f"  Locked at win. end  ${still_locked_at_end:>8,.0f}  USDC awaiting post-window resolution")
     print(f"  LT cap budget       ${lt_budget:>8,.0f}  USDC  "
           f"({MAX_LONG_TERM_FRACTION*100:.0f}% of ${TOTAL_CAPITAL:,.0f} wallet — "
           f"${lt_locked:,.0f} used by >30-day positions, ${lt_budget - lt_locked:,.0f} remaining)")
     print(f"  Net PnL             ${total_pnl:>+8.2f}  "
           f"(${total_pnl/period_days:.2f}/day  ~${total_pnl/period_days*365:,.0f}/yr)")
     print(f"  Return on capital   {roc:>+7.2f}%  over {period_days:.1f} days  "
-          f"(~{roc/period_days*365:.0f}% ann.)  [vs ${capital_at_resolution:,.0f} locked]")
+          f"(~{roc/period_days*365:.0f}% ann.)  [vs ${peak_locked:,.0f} peak concurrent]")
     if not math.isnan(sharpe_ann):
         print(f"  Sharpe (ann.)       {sharpe_ann:>7.2f}")
     print("=" * 55)
@@ -360,12 +406,18 @@ def main():
     # ------------------------------------------------------------------ #
     #  DETAIL SECTIONS  (full breakdown below the card)                   #
     # ------------------------------------------------------------------ #
+    # Gross + Costs = Net.  The round-trip/resolution components are
+    # net-of-fees in the simulator, so they decompose NET, not gross.
+    gross_pnl    = total_pnl + total_fees - total_rebates
+    net_fee_cost = total_fees - total_rebates
     print(f"\n  PnL BREAKDOWN")
-    print(f"  Round-trip PnL      ${total_roundtrip_pnl:+.2f}  (open + close captured)")
-    print(f"  Resolution PnL      ${total_res_pnl:+.2f}  (held to $1.00)")
-    print(f"  Gross (pre-fee)     ${total_pnl + total_fees - total_rebates:+.2f}")
-    print(f"  Maker rebates       ${total_rebates:+.2f}")
-    print(f"  Taker fees          $-{total_fees:.2f}")
+    print(f"  Gross (pre-fee)     ${gross_pnl:+10,.2f}")
+    print(f"  Costs               ${-net_fee_cost:+10,.2f}")
+    print(f"    Taker fees        ${-total_fees:+10,.2f}")
+    print(f"    Maker rebates     ${total_rebates:+10,.2f}")
+    print(f"  Net PnL             ${total_pnl:+10,.2f}")
+    print(f"    Round-trip PnL    ${total_roundtrip_pnl:+10,.2f}  (closed in window, net of fees)")
+    print(f"    Resolution PnL    ${total_res_pnl:+10,.2f}  (settled at $1.00, net of fees)")
     print(f"  Win rate            {win_rate:.1f}%")
 
     # Per-level fill breakdown — aggregate fills_by_level across all markets
