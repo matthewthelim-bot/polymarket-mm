@@ -84,8 +84,9 @@ Useful flags: `--total-capital`, `--max-long-term-fraction`,
   opens/closes shorts. Round-trip PnL is finalised on close; unclosed
   positions settle at $1.00 at resolution.
 - **Risk caps** (`PortfolioConstraints`, shared across all markets):
-  - Long-term cap: ≤ 80 % of capital in positions resolving > 30 days out.
-    Short-duration positions (< 30 days) are uncapped by this rule.
+  - Long-term cap: ≤ 30 % of capital in positions resolving > 30 days out
+    (liquidity guard — keeps the wallet free for fast-recycling short-duration
+    markets). Short-duration positions (< 30 days) are uncapped by this rule.
   - Per-market notional cap, and an optional per-event cap.
   - Caps are enforced **at quote time** (suppression), never at fill time —
     a fill that lands is always recorded.
@@ -113,22 +114,28 @@ sudo systemctl status polymarket-collector
 sudo journalctl -u polymarket-collector -n 50 --no-pager
 ```
 
-Service flags: `--min-volume 1000 --refresh-interval 60 --stats-interval 300`.
+Service flags: `--min-volume 1000 --refresh-interval 60 --stats-interval 300`
+(plus `--std-shards 3` default).
 
-**Three WebSocket connections** (important): Polymarket's WS pushes events for
-only ~50 active markets per connection, no matter how many tokens you
-subscribe. The collector therefore splits subscriptions:
+**Multiple WebSocket connections** (important): Polymarket's WS pushes events
+for only ~50 active markets per connection, no matter how many tokens you
+subscribe. The collector therefore runs five connections:
 
-- standard Gamma markets (volume-filtered)
+- 3 standard-market shards, split by 24 h-volume tier (`--std-shards`)
 - high-frequency series (5 m/15 m BTC/ETH/SOL/XRP up-or-down)
 - low-frequency series (daily up-or-down, MLB, UFC, weekly strikes)
 
 Each connection captures its own top-50, so series markets are not crowded
-out by global-volume leaders. New series windows are discovered by the
-refresh thread (60 s) and subscribed on the next WS reconnect (~5 min).
+out by global-volume leaders, and standard coverage scales with shard count.
+New series windows are discovered by the refresh thread (60 s) and subscribed
+on the next WS reconnect (~5 min).
+
+A health-check cron (`collector_healthcheck.sh`, every 10 min) restarts the
+service if today's data dir has no writes for 10 minutes; it logs to
+`/var/log/polymarket-healthcheck.log`.
 
 To deploy a collector change: copy `scripts/collect_books.py` to the box,
-`sudo systemctl restart polymarket-collector`, then confirm all three
+`sudo systemctl restart polymarket-collector`, then confirm all five
 "Subscribed to book channel" lines appear in the journal.
 
 ## Known API quirks (hard-won — do not rediscover)

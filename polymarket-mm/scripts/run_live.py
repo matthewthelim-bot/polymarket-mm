@@ -498,7 +498,7 @@ async def main_async(args: argparse.Namespace) -> None:
     # Shared portfolio constraints (enforced across all active QuoteLoops)
     portfolio = PortfolioConstraints(
         total_capital=getattr(args, "total_capital", 10_000.0),
-        max_long_term_fraction=getattr(args, "max_long_term_fraction", 0.80),
+        max_long_term_fraction=getattr(args, "max_long_term_fraction", 0.30),
         max_event_notional=getattr(args, "max_event_notional", 3_000.0),
     )
     log.info(
@@ -742,8 +742,10 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--total-capital", type=float, default=10_000.0,
                         help="Total wallet capital in USDC (default 10000)")
-    parser.add_argument("--max-long-term-fraction", type=float, default=0.80,
-                        help="Max fraction of capital in >30-day positions (default 0.80)")
+    parser.add_argument("--max-long-term-fraction", type=float, default=0.30,
+                        help="Max fraction of capital lockable in >30-day positions "
+                             "(default 0.30). Liquidity guard: keeps the rest of the "
+                             "wallet free for fast-recycling short-duration markets.")
     parser.add_argument("--max-event-notional", type=float, default=0.0,
                         help="Max USDC per Gamma event group (default 0=disabled). "
                              "When enabled, real event IDs are fetched per market "

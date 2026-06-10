@@ -45,8 +45,11 @@ class PortfolioConstraints:
 
     total_capital: float = 10_000.0
     # Fraction of total_capital that may be in positions resolving beyond
-    # long_term_threshold_days.  0.80 = 80 % = $8,000 on a $10 k account.
-    max_long_term_fraction: float = 0.80
+    # long_term_threshold_days.  This is a liquidity guard: capital locked in
+    # long-dated positions can't be recycled into fast-resolving markets,
+    # which carry more volume/volatility and recycle in hours-to-days.
+    # 0.30 = 30 % = $3,000 on a $10 k account.
+    max_long_term_fraction: float = 0.30
     # Absolute USDC cap per Gamma event group.  0 = disabled.
     max_event_notional: float = 0.0
     # Absolute USDC cap per individual market.  0 = disabled.

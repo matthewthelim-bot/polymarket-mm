@@ -38,7 +38,7 @@ LIVE_DIR    = ROOT_DIR / "data" / "live"
 
 # Portfolio-level risk caps — mirror what you'd fund the live wallet with.
 TOTAL_CAPITAL           = 10_000.0   # USDC in wallet
-MAX_LONG_TERM_FRACTION  = 0.80       # max 80 % in positions resolving >30 days out (~$8k)
+MAX_LONG_TERM_FRACTION  = 0.30       # max 30 % lockable in >30-day positions — liquidity guard
 MAX_EVENT_NOTIONAL      = 0.0        # per-event cap disabled — per-market cap handles concentration
 MAX_MARKET_NOTIONAL     = 2_000.0    # max USDC per individual market (prevents single-name blowup)
 

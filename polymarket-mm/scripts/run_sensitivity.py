@@ -24,10 +24,10 @@ LIVE_DIR     = ROOT_DIR / "data" / "live"
 MAX_MARKET_NOTIONAL = 2_000.0
 
 SCENARIOS = [
-    ("Baseline  $10k  80% cap", 10_000.0, 0.80),
-    ("$20k cap  $20k  80% cap", 20_000.0, 0.80),
-    ("Loose cap $10k  95% cap", 10_000.0, 0.95),
-    ("Both      $20k  95% cap", 20_000.0, 0.95),
+    ("Tight     $20k  20% cap", 20_000.0, 0.20),
+    ("Default   $20k  30% cap", 20_000.0, 0.30),
+    ("Mid       $20k  50% cap", 20_000.0, 0.50),
+    ("Legacy    $20k  80% cap", 20_000.0, 0.80),
 ]
 
 

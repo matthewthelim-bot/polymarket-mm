@@ -18,6 +18,12 @@ def make_pc(**kw):
 
 
 class TestLongTermCap:
+    def test_default_fraction_is_liquidity_guarded(self):
+        # Default deliberately low: long-dated positions lock capital that
+        # short-duration markets could recycle. Changing this default changes
+        # live risk posture — update intentionally.
+        assert PortfolioConstraints().max_long_term_fraction == 0.30
+
     def test_max_long_term_notional_derived(self):
         pc = make_pc()
         assert pc.max_long_term_notional == 8_000.0
