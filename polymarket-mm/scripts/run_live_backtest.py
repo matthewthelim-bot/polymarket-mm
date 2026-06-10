@@ -321,10 +321,21 @@ def main():
     print(f"  Avg notional        ${avg_notional:>8,.2f}  per position (both legs)")
     print(f"  Recycling           {recycled_pct:>5.1f}%  "
           f"({total_roundtrips} closed within window / {total_positions} opened)")
+    # Long-term locked = open positions in markets resolving >30 days out.
+    # Only this counts against the LT budget; short-duration positions don't.
+    lt_open_positions = 0
+    for mid, r, _, _ in results:
+        days_left = market_resolution.get(mid, ("", 9999, ""))[1]
+        if days_left > 30:
+            longs_closed  = r.num_ask_arb_cycles - r.num_shorts_opened
+            shorts_closed = r.num_bid_arb_cycles - r.num_longs_opened
+            lt_open_positions += (max(0, r.num_longs_opened - longs_closed)
+                                  + max(0, r.num_shorts_opened - shorts_closed))
+    lt_locked = lt_open_positions * avg_notional
     print(f"  Capital at end      ${capital_at_resolution:>8,.0f}  USDC locked in {net_open} open positions")
     print(f"  LT cap budget       ${lt_budget:>8,.0f}  USDC  "
           f"({MAX_LONG_TERM_FRACTION*100:.0f}% of ${TOTAL_CAPITAL:,.0f} wallet — "
-          f"${lt_budget - capital_at_resolution:,.0f} remaining)")
+          f"${lt_locked:,.0f} used by >30-day positions, ${lt_budget - lt_locked:,.0f} remaining)")
     print(f"  Net PnL             ${total_pnl:>+8.2f}  "
           f"(${total_pnl/period_days:.2f}/day  ~${total_pnl/period_days*365:,.0f}/yr)")
     print(f"  Return on capital   {roc:>+7.2f}%  over {period_days:.1f} days  "
