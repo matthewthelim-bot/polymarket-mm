@@ -407,35 +407,43 @@ class QuoteLoop:
         order_key = self._identify_filled_order(fill)
         # order_key format: "<side>_<level>" e.g. "yes_bid_0", "no_ask_2"
 
+        PARTIAL_EPS = 0.5  # contracts; fills within this of order size = full
+
+        def _consume(ladder: list, key_prefix: str, handler) -> None:
+            """Partial-fill-aware slot consumption for one routed fill.
+
+            PARTIAL (fill.size < tracked size - eps): the remainder is still
+            LIVE on the exchange — decrement the tracked size and KEEP the
+            slot occupied. Clearing it would orphan the live remainder
+            (later fills become unroutable naked exposure) and let the next
+            cycle post a duplicate order at the same level.
+            FULL: clear the slot; re-post iceberg slice if reserve remains.
+            Either way, hedge exactly the filled amount.
+            """
+            level = int(order_key.rsplit("_", 1)[1])
+            order = ladder[level]
+            tracked = order.size if order else fill.size
+            filled = min(fill.size, tracked)
+            if order and filled < tracked - PARTIAL_EPS:
+                order.size = tracked - filled
+                logger.info(
+                    "[%s] PARTIAL maker fill %s: %.1f of %.1f — %.1f remains live",
+                    self.config.market_id, order_key, filled, tracked, order.size,
+                )
+            else:
+                ladder[level] = None
+                if order and order.remaining_hidden > 0.5:
+                    self._repost_iceberg_slice(ladder, level, order)
+            handler(fill.price, filled)
+
         if order_key.startswith("yes_bid_"):
-            level = int(order_key.rsplit("_", 1)[1])
-            filled_order = self._yes_bids[level]
-            self._yes_bids[level] = None
-            self._handle_yes_bid_fill(fill.price, fill.size)
-            # Iceberg: re-post next slice at same price if hidden reserve remains
-            if filled_order and filled_order.remaining_hidden > 0.5:
-                self._repost_iceberg_slice(self._yes_bids, level, filled_order)
+            _consume(self._yes_bids, "yes_bid", self._handle_yes_bid_fill)
         elif order_key.startswith("yes_ask_"):
-            level = int(order_key.rsplit("_", 1)[1])
-            filled_order = self._yes_asks[level]
-            self._yes_asks[level] = None
-            self._handle_yes_ask_fill(fill.price, fill.size)
-            if filled_order and filled_order.remaining_hidden > 0.5:
-                self._repost_iceberg_slice(self._yes_asks, level, filled_order)
+            _consume(self._yes_asks, "yes_ask", self._handle_yes_ask_fill)
         elif order_key.startswith("no_bid_"):
-            level = int(order_key.rsplit("_", 1)[1])
-            filled_order = self._no_bids[level]
-            self._no_bids[level] = None
-            self._handle_no_bid_fill(fill.price, fill.size)
-            if filled_order and filled_order.remaining_hidden > 0.5:
-                self._repost_iceberg_slice(self._no_bids, level, filled_order)
+            _consume(self._no_bids, "no_bid", self._handle_no_bid_fill)
         elif order_key.startswith("no_ask_"):
-            level = int(order_key.rsplit("_", 1)[1])
-            filled_order = self._no_asks[level]
-            self._no_asks[level] = None
-            self._handle_no_ask_fill(fill.price, fill.size)
-            if filled_order and filled_order.remaining_hidden > 0.5:
-                self._repost_iceberg_slice(self._no_asks, level, filled_order)
+            _consume(self._no_asks, "no_ask", self._handle_no_ask_fill)
         else:
             logger.warning(
                 "[%s] Could not route fill (token_side=%s price=%.3f) — recording as open",

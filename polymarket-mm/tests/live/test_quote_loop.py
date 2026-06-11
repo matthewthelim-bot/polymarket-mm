@@ -280,3 +280,64 @@ class TestSnapshot:
             assert key in snap
         assert snap["fills"] == 1
         assert snap["long_notional"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Partial MAKER fills — remainder must stay tracked and live
+# ---------------------------------------------------------------------------
+
+class TestPartialMakerFills:
+    def test_partial_fill_keeps_slot_and_decrements(self):
+        client = FakeClobClient()
+        loop = make_loop(client)
+        loop._yes_bids[0] = resting(0.45, YES, Side.BUY, "bid")  # size 100
+        loop.on_fill(yes_fill(0.45, size=30.0))
+        # Hedge exactly the filled 30
+        assert client.placed[0].size == pytest.approx(30.0)
+        # Slot still occupied with the live remainder
+        order = loop._yes_bids[0]
+        assert order is not None
+        assert order.size == pytest.approx(70.0)
+
+    def test_second_partial_routes_to_same_slot(self):
+        client = FakeClobClient()
+        loop = make_loop(client)
+        loop._yes_bids[0] = resting(0.45, YES, Side.BUY, "bid")
+        loop.on_fill(yes_fill(0.45, size=30.0))
+        loop.on_fill(yes_fill(0.45, size=50.0))
+        # Both routed (NOT unknown/dead-letter), hedged 30 then 50
+        assert [o.size for o in client.placed] == [pytest.approx(30.0),
+                                                   pytest.approx(50.0)]
+        assert loop._yes_bids[0].size == pytest.approx(20.0)
+        assert all(p.fill_type != "unknown_YES" for p in loop._open_positions)
+
+    def test_full_fill_clears_slot(self):
+        client = FakeClobClient()
+        loop = make_loop(client)
+        loop._yes_bids[0] = resting(0.45, YES, Side.BUY, "bid")
+        loop.on_fill(yes_fill(0.45, size=100.0))
+        assert loop._yes_bids[0] is None
+
+    def test_near_full_fill_treated_as_full(self):
+        # Within PARTIAL_EPS (0.5 contracts) of the tracked size = full fill
+        client = FakeClobClient()
+        loop = make_loop(client)
+        loop._yes_bids[0] = resting(0.45, YES, Side.BUY, "bid")
+        loop.on_fill(yes_fill(0.45, size=99.8))
+        assert loop._yes_bids[0] is None
+
+    def test_oversized_fill_clamped_to_tracked(self):
+        client = FakeClobClient()
+        loop = make_loop(client)
+        loop._yes_bids[0] = resting(0.45, YES, Side.BUY, "bid")
+        loop.on_fill(yes_fill(0.45, size=150.0))  # stale/duplicated report
+        assert loop._yes_bids[0] is None
+        assert client.placed[0].size == pytest.approx(100.0)  # hedge tracked size only
+
+    def test_partial_on_ask_side(self):
+        client = FakeClobClient()
+        loop = make_loop(client)
+        loop._no_asks[0] = resting(0.52, NO, Side.SELL, "ask")
+        loop.on_fill(no_fill(0.52, size=25.0))
+        assert loop._no_asks[0].size == pytest.approx(75.0)
+        assert client.placed[0].size == pytest.approx(25.0)

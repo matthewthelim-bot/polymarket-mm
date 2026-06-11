@@ -604,6 +604,10 @@ class BacktestSimulator:
                     book_size_at_price=competing,
                 )
                 maker_filled = self.fill_model.simulate_fill(fill_inp).filled_size
+                # Cap by hedgeable depth: a fill we couldn't hedge is a fill
+                # we wouldn't have taken (and must not silently vanish from
+                # the trade's remaining size).
+                maker_filled = min(maker_filled, hedge_budget)
                 if maker_filled <= 0:
                     break
 
@@ -704,6 +708,10 @@ class BacktestSimulator:
                     is_ask=True,
                 )
                 maker_filled = self.fill_model.simulate_fill(fill_inp).filled_size
+                # Cap by hedgeable depth: a fill we couldn't hedge is a fill
+                # we wouldn't have taken (and must not silently vanish from
+                # the trade's remaining size).
+                maker_filled = min(maker_filled, hedge_budget)
                 if maker_filled <= 0:
                     break
 
@@ -803,6 +811,10 @@ class BacktestSimulator:
                     book_size_at_price=competing,
                 )
                 maker_filled = self.fill_model.simulate_fill(fill_inp).filled_size
+                # Cap by hedgeable depth: a fill we couldn't hedge is a fill
+                # we wouldn't have taken (and must not silently vanish from
+                # the trade's remaining size).
+                maker_filled = min(maker_filled, hedge_budget)
                 if maker_filled <= 0:
                     break
 
@@ -902,6 +914,10 @@ class BacktestSimulator:
                     is_ask=True,
                 )
                 maker_filled = self.fill_model.simulate_fill(fill_inp).filled_size
+                # Cap by hedgeable depth: a fill we couldn't hedge is a fill
+                # we wouldn't have taken (and must not silently vanish from
+                # the trade's remaining size).
+                maker_filled = min(maker_filled, hedge_budget)
                 if maker_filled <= 0:
                     break
 
