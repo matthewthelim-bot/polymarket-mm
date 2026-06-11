@@ -45,7 +45,11 @@ class OrderRequest:
     side: Side             # BUY or SELL
     price: float           # limit price (0–1)
     size: float            # number of contracts
-    time_in_force: str = "GTC"   # GTC | IOC | FOK
+    time_in_force: str = "GTC"   # GTC | GTD | IOC | FOK
+    # Unix seconds at which a GTD order self-destructs on the EXCHANGE.
+    # Dead-man safety for locally-run trading: if this process/PC dies,
+    # resting orders expire server-side instead of sitting unattended.
+    expiration: int = 0
 
 
 @dataclass
@@ -342,12 +346,17 @@ class ClobClient:
             raise ValueError(f"Unsupported time_in_force: {order.time_in_force}")
         order_type = order_type_map[tif]
 
-        order_args = OrderArgs(
+        kwargs = dict(
             token_id=order.token_id,
             price=order.price,
             size=order.size,
             side=side_str,
         )
+        if tif == "GTD":
+            if order.expiration <= 0:
+                raise ValueError("GTD order requires a positive expiration timestamp")
+            kwargs["expiration"] = order.expiration
+        order_args = OrderArgs(**kwargs)
         signed = py_client.create_order(order_args)
         resp = py_client.post_order(signed, order_type)
 

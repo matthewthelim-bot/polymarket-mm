@@ -146,6 +146,14 @@ class QuoteLoopConfig:
     max_loss_fraction: float = 0.10
     min_viable_size: float = 1.0
 
+    # Dead-man order expiry: maker orders are placed GTD with this many
+    # seconds of life beyond order_ttl_seconds. If the process/PC dies,
+    # all resting orders self-destruct on the exchange within
+    # order_ttl_seconds + this buffer (Polymarket enforces a ~60s minimum
+    # security threshold on GTD expirations). 0 = plain GTC (NOT
+    # recommended for unattended local operation).
+    order_expiration_buffer: float = 90.0
+
     # Dry run
     dry_run: bool = True                 # NEVER place orders unless False
 
@@ -1017,7 +1025,15 @@ class QuoteLoop:
             )
 
         try:
-            req = OrderRequest(token_id=token_id, side=side, price=price, size=size)
+            if self.config.order_expiration_buffer > 0:
+                # GTD dead-man: order dies on the exchange even if we don't.
+                expiry = int(time.time() + self.config.order_ttl_seconds
+                             + self.config.order_expiration_buffer)
+                req = OrderRequest(token_id=token_id, side=side, price=price,
+                                   size=size, time_in_force="GTD",
+                                   expiration=expiry)
+            else:
+                req = OrderRequest(token_id=token_id, side=side, price=price, size=size)
             REST_RATE_LIMITER.acquire()
             resp = self._client.place_order(req)
             self.stats.orders_placed += 1

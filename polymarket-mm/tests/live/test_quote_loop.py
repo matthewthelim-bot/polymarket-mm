@@ -341,3 +341,34 @@ class TestPartialMakerFills:
         loop.on_fill(no_fill(0.52, size=25.0))
         assert loop._no_asks[0].size == pytest.approx(75.0)
         assert client.placed[0].size == pytest.approx(25.0)
+
+
+# ---------------------------------------------------------------------------
+# Dead-man GTD expiry — local-machine safety
+# ---------------------------------------------------------------------------
+
+class TestDeadManExpiry:
+    def test_maker_orders_are_gtd_with_expiry(self):
+        client = FakeClobClient()
+        loop = make_loop(client)
+        # Drive one maker placement via the internal helper
+        resp = loop._place_order(YES, Side.BUY, 0.45, 100.0, "yes_bid_0")
+        assert resp is not None
+        order = client.placed[0]
+        assert order.time_in_force == "GTD"
+        # Expiry ~ttl(300) + buffer(90) from now
+        assert order.expiration > time.time() + 300
+        assert order.expiration < time.time() + 300 + 90 + 30
+
+    def test_taker_hedge_stays_ioc(self):
+        client = FakeClobClient()
+        loop = make_loop(client)
+        loop._yes_bids[0] = resting(0.45, YES, Side.BUY, "bid")
+        loop.on_fill(yes_fill(0.45))
+        assert client.placed[0].time_in_force == "IOC"
+
+    def test_zero_buffer_falls_back_to_gtc(self):
+        client = FakeClobClient()
+        loop = make_loop(client, order_expiration_buffer=0.0)
+        loop._place_order(YES, Side.BUY, 0.45, 100.0, "yes_bid_0")
+        assert client.placed[0].time_in_force == "GTC"
