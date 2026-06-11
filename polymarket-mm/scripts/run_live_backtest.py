@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.live.portfolio_state import PortfolioConstraints
+from src.backtest.fill_model import QueueModel
 from src.backtest.live_harness import (
     LADDER_LEVELS, LADDER_OFFSET, LADDER_TICK, LADDER_SIZE_RATIOS,
     ICEBERG_DISPLAY_SIZE,
@@ -122,6 +123,13 @@ def main():
                         help="Skip EC2 sync and use whatever is in data/live already")
     parser.add_argument("--capital", type=float, default=None,
                         help="Override TOTAL_CAPITAL (default: use script constant)")
+    parser.add_argument("--queue-model", default="FRONT",
+                        choices=["FRONT", "PRO_RATA", "BACK"],
+                        help="Fill queue position model. FRONT = always first "
+                             "in queue at our price (optimistic); PRO_RATA = "
+                             "share of trade proportional to our fraction of "
+                             "displayed depth (realistic); BACK = behind all "
+                             "displayed depth (pessimistic).")
     args = parser.parse_args()
 
     # Allow CLI override of capital
@@ -175,10 +183,32 @@ def main():
         fee_rate, rebate_rate = fetch_fee_schedule(cid, slug)
         return end_date_str, days_left, end_date_str, fee_rate, rebate_rate
 
+    # Same-day cache: end dates and fee schedules are stable within a day,
+    # and refetching ~600 markets costs minutes per run.
+    cache_path = LIVE_DIR / "meta_cache.json"
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cache = {}
+    try:
+        raw = json.loads(cache_path.read_text())
+        if raw.get("date") == today_str:
+            cache = raw.get("markets", {})
+    except (OSError, json.JSONDecodeError):
+        pass
+    n_fetched = 0
     for i, (mid, _) in enumerate(eligible, 1):
-        market_resolution[mid] = _fetch_market_meta(mid)
+        if mid in cache:
+            market_resolution[mid] = tuple(cache[mid])
+        else:
+            market_resolution[mid] = _fetch_market_meta(mid)
+            cache[mid] = list(market_resolution[mid])
+            n_fetched += 1
         if i % 100 == 0:
             print(f"  {i}/{len(eligible)} ...")
+    try:
+        cache_path.write_text(json.dumps({"date": today_str, "markets": cache}))
+    except OSError:
+        pass
+    print(f"  ({n_fetched} fetched, {len(eligible) - n_fetched} from cache)")
     fee_counts = defaultdict(int)
     for _, _, _, fr, rr in market_resolution.values():
         fee_counts[(fr, rr)] += 1
@@ -219,6 +249,7 @@ def main():
             quote_size=qs,
             fee_rate=fee_rate,
             rebate_frac=rebate_rate,
+            queue_model=QueueModel[args.queue_model],
         )
         r = sim.run(events)
         results.append((mid, r, avg_ts, qs))
@@ -259,6 +290,7 @@ def main():
         period_days = 1.0
     period_days = max(period_days, 0.1)
 
+    queue_desc = f"queue={args.queue_model}"
     iceberg_desc = (
         f"iceberg={int(ICEBERG_DISPLAY_SIZE)} contracts/slice"
         if ICEBERG_DISPLAY_SIZE > 0 else "iceberg=off"
@@ -266,7 +298,7 @@ def main():
     ladder_desc = (
         f"{LADDER_LEVELS} levels  "
         f"offset={LADDER_OFFSET:.3f}  tick={LADDER_TICK:.3f}  "
-        f"sizes=adaptive (base=avg_trade/2)  {iceberg_desc}"
+        f"sizes=adaptive (base=avg_trade/2)  {iceberg_desc}  {queue_desc}"
     )
 
     # ------------------------------------------------------------------ #
@@ -356,6 +388,47 @@ def main():
         mean_cycle = std_cycle = cycles_per_day = sharpe_ann = float('nan')
 
     # ------------------------------------------------------------------ #
+    #  DAILY-PnL Sharpe — the honest one. Per-cycle annualization treats   #
+    #  every cycle as i.i.d. and multiplies by sqrt(cycles/yr), which      #
+    #  flatters high-frequency, truncated-loss strategies enormously.     #
+    #  Here: round-trip PnL lands on its close date; each market's        #
+    #  resolution PnL lands on its resolution date (or window end).       #
+    #  Zero-activity days inside the window count as $0 days.             #
+    # ------------------------------------------------------------------ #
+    daily_pnl = defaultdict(float)
+    window_end_d = window_end.date()
+    for mid, r, _, _ in results:
+        for ts_e, net in r.pnl_events:
+            daily_pnl[ts_e.date()] += net
+        if r.resolution_pnl:
+            end_date_str = market_resolution.get(mid, ("unknown",))[0]
+            try:
+                res_d = datetime.fromisoformat(end_date_str).date()
+                res_d = min(res_d, window_end_d)
+            except ValueError:
+                res_d = window_end_d
+            daily_pnl[res_d] += r.resolution_pnl
+    if daily_pnl:
+        d0, d1 = min(daily_pnl), max(daily_pnl)
+        from datetime import timedelta as _td
+        series = []
+        d = d0
+        while d <= d1:
+            series.append(daily_pnl.get(d, 0.0))
+            d += _td(days=1)
+        if len(series) >= 2 and statistics.stdev(series) > 0:
+            sharpe_daily = (math.sqrt(365.0) * statistics.mean(series)
+                            / statistics.stdev(series))
+        else:
+            sharpe_daily = float('nan')
+        best_day  = max(daily_pnl.values())
+        worst_day = min(daily_pnl.values())
+        n_days    = len(series)
+    else:
+        sharpe_daily = best_day = worst_day = float('nan')
+        n_days = 0
+
+    # ------------------------------------------------------------------ #
     #  SUMMARY CARD  (always printed, always the same 8 lines)            #
     # ------------------------------------------------------------------ #
     print("\n" + "=" * 55)
@@ -404,7 +477,9 @@ def main():
     print(f"  Return on capital   {roc:>+7.2f}%  over {period_days:.1f} days  "
           f"(~{roc/period_days*365:.0f}% ann.)  [vs ${peak_locked:,.0f} peak concurrent]")
     if not math.isnan(sharpe_ann):
-        print(f"  Sharpe (ann.)       {sharpe_ann:>7.2f}")
+        print(f"  Sharpe (per-cycle)  {sharpe_ann:>7.2f}  (i.i.d.-cycle annualization — flattering)")
+    if not math.isnan(sharpe_daily):
+        print(f"  Sharpe (daily PnL)  {sharpe_daily:>7.2f}  ({n_days} days, best ${best_day:+,.0f} / worst ${worst_day:+,.0f})")
     print("=" * 55)
 
     # Show the Sharpe calculation so it can always be verified

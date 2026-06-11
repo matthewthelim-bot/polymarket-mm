@@ -219,6 +219,7 @@ def make_simulator(market_id: str, days_to_resolution: int = 9999,
                    iceberg_display_size: float = ICEBERG_DISPLAY_SIZE,
                    fee_rate: Optional[float] = None,
                    rebate_frac: Optional[float] = None,
+                   queue_model: QueueModel = QueueModel.FRONT,
                    ) -> BacktestSimulator:
     """Build a dual-book BacktestSimulator with the standard live parameters.
 
@@ -246,7 +247,7 @@ def make_simulator(market_id: str, days_to_resolution: int = 9999,
         quote_engine=QuoteEngine(fm, fee_rate, rebate_frac, LADDER_OFFSET, 0.005),
         inventory_manager=InventoryManager(market_id, 0.0003),
         pnl_engine=PnLEngine(fm, fee_rate, rebate_frac),
-        fill_model=FillModel(FillModelConfig(queue_model=QueueModel.FRONT,
+        fill_model=FillModel(FillModelConfig(queue_model=queue_model,
                                              latency_ms=LATENCY_MS)),
         skew_config=skew,
         config=SimulatorConfig(

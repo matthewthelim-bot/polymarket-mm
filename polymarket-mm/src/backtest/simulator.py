@@ -144,6 +144,9 @@ class SimulationResult:
     num_ask_arb_cycles: int = 0            # completed ask-side arb cycles
     num_portfolio_blocked: int = 0         # arb opens skipped due to portfolio caps
     fills_by_level: list = field(default_factory=list)  # fill count per ladder level (index = level)
+    # (timestamp, net_pnl) for each round-trip close — enables an honest
+    # DAILY-PnL Sharpe in the report (per-cycle annualization overstates).
+    pnl_events: list = field(default_factory=list)
     # Per-position capital intervals: (opened_at, closed_at, notional).
     # closed_at is None for positions still open at the end of the data —
     # they release capital at the market's resolution time (caller resolves).
@@ -587,12 +590,18 @@ class BacktestSimulator:
 
             while remaining_hidden > 0.5 and remaining_trade > 0.5 and hedge_budget > 0.5:
                 chunk = min(display, remaining_hidden)
+                # Competing displayed depth at-or-better than our level — the
+                # liquidity that was actually quoted there and shares (PRO_RATA)
+                # or precedes (BACK) us in capturing the observed flow.
+                competing = sum(
+                    l.size for l in self._current_book.bids if l.price >= yes_bid - 1e-9
+                )
                 fill_inp = FillModelInput(
                     quote_price=yes_bid,
                     quote_size=chunk,
                     market_trade_price=trade.price,
                     market_trade_size=remaining_trade,
-                    book_size_at_price=0.0,
+                    book_size_at_price=competing,
                 )
                 maker_filled = self.fill_model.simulate_fill(fill_inp).filled_size
                 if maker_filled <= 0:
@@ -676,7 +685,20 @@ class BacktestSimulator:
 
             while remaining_hidden > 0.5 and remaining_trade > 0.5 and hedge_budget > 0.5:
                 chunk = min(display, remaining_hidden)
-                maker_filled = min(remaining_trade, chunk)
+                # Competing displayed depth at-or-better than our level — the
+                # liquidity that was actually quoted there and shares (PRO_RATA)
+                # or precedes (BACK) us in capturing the observed flow.
+                competing = sum(
+                    l.size for l in self._current_book.asks if l.price <= yes_ask + 1e-9
+                )
+                fill_inp = FillModelInput(
+                    quote_price=yes_ask,
+                    quote_size=chunk,
+                    market_trade_price=trade.price,
+                    market_trade_size=remaining_trade,
+                    book_size_at_price=competing,
+                )
+                maker_filled = self.fill_model.simulate_fill(fill_inp).filled_size
                 if maker_filled <= 0:
                     break
 
@@ -758,12 +780,18 @@ class BacktestSimulator:
 
             while remaining_hidden > 0.5 and remaining_trade > 0.5 and hedge_budget > 0.5:
                 chunk = min(display, remaining_hidden)
+                # Competing displayed depth at-or-better than our level — the
+                # liquidity that was actually quoted there and shares (PRO_RATA)
+                # or precedes (BACK) us in capturing the observed flow.
+                competing = sum(
+                    l.size for l in self._no_book.bids if l.price >= no_bid - 1e-9
+                )
                 fill_inp = FillModelInput(
                     quote_price=no_bid,
                     quote_size=chunk,
                     market_trade_price=trade.price,
                     market_trade_size=remaining_trade,
-                    book_size_at_price=0.0,
+                    book_size_at_price=competing,
                 )
                 maker_filled = self.fill_model.simulate_fill(fill_inp).filled_size
                 if maker_filled <= 0:
@@ -846,7 +874,20 @@ class BacktestSimulator:
 
             while remaining_hidden > 0.5 and remaining_trade > 0.5 and hedge_budget > 0.5:
                 chunk = min(display, remaining_hidden)
-                maker_filled = min(remaining_trade, chunk)
+                # Competing displayed depth at-or-better than our level — the
+                # liquidity that was actually quoted there and shares (PRO_RATA)
+                # or precedes (BACK) us in capturing the observed flow.
+                competing = sum(
+                    l.size for l in self._no_book.asks if l.price <= no_ask + 1e-9
+                )
+                fill_inp = FillModelInput(
+                    quote_price=no_ask,
+                    quote_size=chunk,
+                    market_trade_price=trade.price,
+                    market_trade_size=remaining_trade,
+                    book_size_at_price=competing,
+                )
+                maker_filled = self.fill_model.simulate_fill(fill_inp).filled_size
                 if maker_filled <= 0:
                     break
 
@@ -960,6 +1001,7 @@ class BacktestSimulator:
                 pos.entry_yes + pos.entry_no - maker_price - taker_price
             ) * close_size
             net = gross + fee_share + fees_net_pc * close_size
+            self._result.pnl_events.append((timestamp, net))
             self._result.total_spread_pnl += net
             self._result.round_trip_pnl += net
             self._result.num_round_trips += 1
