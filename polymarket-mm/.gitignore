@@ -32,3 +32,4 @@ Thumbs.db
 *.log
 logs/
 ec2_watchdog.log
+dashboard.log
