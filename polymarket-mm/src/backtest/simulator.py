@@ -623,7 +623,11 @@ class BacktestSimulator:
                 )
                 self._as_tracker.on_fill(yes_bid, trade.timestamp)
                 hedge_budget     -= cycle_size
-                remaining_hidden -= maker_filled
+                # Advance by the full displayed chunk, not the filled amount:
+                # the unfilled remainder of a chunk lost its queue turn for
+                # this trade. (Re-applying PRO_RATA to the same trade in
+                # shrinking slices would otherwise capture ~all of it.)
+                remaining_hidden -= chunk
                 remaining_trade  -= maker_filled
 
     def _check_yes_ask_fill(self, trade: Fill, fv: float) -> None:
@@ -697,6 +701,7 @@ class BacktestSimulator:
                     market_trade_price=trade.price,
                     market_trade_size=remaining_trade,
                     book_size_at_price=competing,
+                    is_ask=True,
                 )
                 maker_filled = self.fill_model.simulate_fill(fill_inp).filled_size
                 if maker_filled <= 0:
@@ -717,7 +722,11 @@ class BacktestSimulator:
                 )
                 self._as_tracker.on_fill(yes_ask, trade.timestamp)
                 hedge_budget     -= cycle_size
-                remaining_hidden -= maker_filled
+                # Advance by the full displayed chunk, not the filled amount:
+                # the unfilled remainder of a chunk lost its queue turn for
+                # this trade. (Re-applying PRO_RATA to the same trade in
+                # shrinking slices would otherwise capture ~all of it.)
+                remaining_hidden -= chunk
                 remaining_trade  -= maker_filled
 
     def _check_no_bid_fill(self, trade: Fill, fv: float) -> None:
@@ -813,7 +822,11 @@ class BacktestSimulator:
                 )
                 self._as_tracker.on_fill(no_bid, trade.timestamp)
                 hedge_budget     -= cycle_size
-                remaining_hidden -= maker_filled
+                # Advance by the full displayed chunk, not the filled amount:
+                # the unfilled remainder of a chunk lost its queue turn for
+                # this trade. (Re-applying PRO_RATA to the same trade in
+                # shrinking slices would otherwise capture ~all of it.)
+                remaining_hidden -= chunk
                 remaining_trade  -= maker_filled
 
     def _check_no_ask_fill(self, trade: Fill, fv: float) -> None:
@@ -886,6 +899,7 @@ class BacktestSimulator:
                     market_trade_price=trade.price,
                     market_trade_size=remaining_trade,
                     book_size_at_price=competing,
+                    is_ask=True,
                 )
                 maker_filled = self.fill_model.simulate_fill(fill_inp).filled_size
                 if maker_filled <= 0:
@@ -906,7 +920,11 @@ class BacktestSimulator:
                 )
                 self._as_tracker.on_fill(no_ask, trade.timestamp)
                 hedge_budget     -= cycle_size
-                remaining_hidden -= maker_filled
+                # Advance by the full displayed chunk, not the filled amount:
+                # the unfilled remainder of a chunk lost its queue turn for
+                # this trade. (Re-applying PRO_RATA to the same trade in
+                # shrinking slices would otherwise capture ~all of it.)
+                remaining_hidden -= chunk
                 remaining_trade  -= maker_filled
 
     # ------------------------------------------------------------------

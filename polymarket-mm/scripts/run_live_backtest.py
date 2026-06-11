@@ -123,6 +123,10 @@ def main():
                         help="Skip EC2 sync and use whatever is in data/live already")
     parser.add_argument("--capital", type=float, default=None,
                         help="Override TOTAL_CAPITAL (default: use script constant)")
+    parser.add_argument("--size-clamp", type=float, default=500.0,
+                        help="Max base quote size in contracts (default 500)")
+    parser.add_argument("--market-cap", type=float, default=None,
+                        help="Override MAX_MARKET_NOTIONAL per-market USDC cap")
     parser.add_argument("--queue-model", default="FRONT",
                         choices=["FRONT", "PRO_RATA", "BACK"],
                         help="Fill queue position model. FRONT = always first "
@@ -133,9 +137,11 @@ def main():
     args = parser.parse_args()
 
     # Allow CLI override of capital
-    global TOTAL_CAPITAL
+    global TOTAL_CAPITAL, MAX_MARKET_NOTIONAL
     if args.capital is not None:
         TOTAL_CAPITAL = args.capital
+    if args.market_cap is not None:
+        MAX_MARKET_NOTIONAL = args.market_cap
 
     if not args.no_sync:
         sync_from_ec2()
@@ -240,7 +246,7 @@ def main():
         end_date_str, days_left, event_key, fee_rate, rebate_rate = market_resolution[mid]
         events = load_market_events(files)
         avg_ts = compute_avg_trade_size(events)
-        qs     = adaptive_quote_size(avg_ts)
+        qs     = adaptive_quote_size(avg_ts, clamp=args.size_clamp)
         sim = make_simulator(
             mid,
             days_to_resolution=days_left,

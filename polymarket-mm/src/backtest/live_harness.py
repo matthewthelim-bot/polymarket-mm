@@ -200,13 +200,13 @@ def compute_avg_trade_size(events) -> float:
     return statistics.mean(sizes) if sizes else QUOTE_SIZE
 
 
-def adaptive_quote_size(avg_trade_size: float) -> float:
+def adaptive_quote_size(avg_trade_size: float, clamp: float = 500.0) -> float:
     """Base ladder quote size from a market's average trade size.
 
     With ratios [1.0, 1.5, 2.0, 2.5, 3.0] and base = avg/2, the middle level
-    (L2) matches a typical full trade. Clamped to [5, 500] contracts.
+    (L2) matches a typical full trade. Clamped to [5, clamp] contracts.
     """
-    return max(5.0, min(500.0, round(avg_trade_size / 2)))
+    return max(5.0, min(clamp, round(avg_trade_size / 2)))
 
 
 # ---------------------------------------------------------------------------

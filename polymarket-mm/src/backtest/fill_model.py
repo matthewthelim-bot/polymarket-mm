@@ -30,6 +30,7 @@ class FillModelInput:
     market_trade_price: float
     market_trade_size: float
     book_size_at_price: float   # total book depth at our quote price
+    is_ask: bool = False        # False = resting BID, True = resting ASK
 
     def __post_init__(self):
         if self.quote_size < 0:
@@ -60,10 +61,17 @@ class FillModel:
         i.e. the market came down to our level or below.  Exact-price matching is wrong
         here because the market maker posts *below* the current mid and waits.
 
-        Returns filled_size=0 if the trade price is above our bid.
+        For a resting ASK (is_ask=True) the gate mirrors: a market BUY must
+        reach UP to our level (trade price >= ask). Returns filled_size=0 when
+        the trade did not reach our side of the book.
         """
-        # Fill only when the market trades at or below our bid
-        if inp.market_trade_price > inp.quote_price + 1e-9:
+        if inp.is_ask:
+            # Fill only when the market trades at or above our ask
+            if inp.market_trade_price < inp.quote_price - 1e-9:
+                return FillModelResult(filled_size=0.0, fill_price=inp.quote_price,
+                                       latency_ms=self.config.latency_ms)
+        elif inp.market_trade_price > inp.quote_price + 1e-9:
+            # Fill only when the market trades at or below our bid
             return FillModelResult(filled_size=0.0, fill_price=inp.quote_price,
                                    latency_ms=self.config.latency_ms)
 
