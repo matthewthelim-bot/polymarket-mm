@@ -262,16 +262,59 @@ class QuoteLoop:
     # Public entry points (called from BookFeed callbacks)
     # ------------------------------------------------------------------
 
+    # Max age of the WS-delivered NO book before we fall back to a REST
+    # fetch. The NO token has its own WS subscription (on_no_book_update);
+    # a blocking REST call on EVERY YES tick would stall the shared feed
+    # thread for all markets — up to 10s per timeout — exactly when books
+    # move fastest (e.g. a goal in a soccer match).
+    NO_BOOK_STALE_SECONDS = 30.0
+
+    def snapshot(self) -> dict:
+        """JSON-safe operational snapshot for the live status monitor."""
+        return {
+            "market": self.config.market_id[:60],
+            "condition_id": self.config.condition_id,
+            "book_updates": self.stats.book_updates,
+            "orders_placed": self.stats.orders_placed,
+            "orders_cancelled": self.stats.orders_cancelled,
+            "fills": self.stats.fills_received,
+            "takers_sent": self.stats.takers_sent,
+            "takers_filled": self.stats.takers_filled,
+            "maker_maker_cycles": self.stats.maker_maker_cycles,
+            "open_unhedged": len(self._open_positions),
+            "unroutable": self.stats.unroutable_fills,
+            "errors": self.stats.errors,
+            "pnl": round(self.stats.total_pnl, 4),
+            "long_notional": round(self._long_notional, 2),
+            "short_notional": round(self._short_notional, 2),
+            "last_fv": round(self._last_fv, 4) if self._last_fv is not None else None,
+        }
+
     def on_yes_book_update(self, token_id: str, yes_book: OrderBook) -> None:
-        """YES book updated — refresh NO book and run one quote cycle."""
+        """YES book updated — run one quote cycle using the WS-fed NO book."""
         self._current_yes_book = yes_book
         self.stats.book_updates += 1
-        try:
-            self._current_no_book = self._client.get_book(self.config.no_token_id)
-        except Exception as exc:
-            logger.warning("[%s] Failed to fetch NO book: %s", self.config.market_id, exc)
-            self.stats.errors += 1
-            return
+        no_book = self._current_no_book
+        no_age = None
+        if no_book is not None:
+            no_ts = no_book.timestamp
+            if no_ts.tzinfo is None:
+                no_ts = no_ts.replace(tzinfo=timezone.utc)
+            no_age = (datetime.now(timezone.utc) - no_ts).total_seconds()
+        if no_book is None or no_age is None or no_age > self.NO_BOOK_STALE_SECONDS:
+            # Fallback only: WS hasn't delivered a (recent) NO book. Rate-limit
+            # so a quiet (but valid) NO book doesn't trigger REST every tick.
+            now_mono = time.monotonic()
+            if now_mono - getattr(self, "_last_no_rest_fetch", 0.0) >= 5.0:
+                self._last_no_rest_fetch = now_mono
+                try:
+                    self._current_no_book = self._client.get_book(self.config.no_token_id)
+                except Exception as exc:
+                    logger.warning("[%s] Failed to fetch NO book: %s", self.config.market_id, exc)
+                    self.stats.errors += 1
+                    return
+            elif no_book is None:
+                return  # nothing usable yet and fetch is rate-limited
         # Retry any open positions now that books are fresh
         self._retry_open_positions()
         self._run_cycle()

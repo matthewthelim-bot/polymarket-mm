@@ -143,6 +143,57 @@ Compute: `realized_capture = pilot fill rate / PRO_RATA prediction`.
 - **Security:** credentials only via `.env` / `credentials.py`; `--live`
   is opt-in; never log keys; pilot wallet holds pilot capital only.
 
+## World Cup compressed timeline (2026-06-11 revision)
+
+The 2026 FIFA World Cup (Jun 11 - Jul 19) front-loads the best conditions
+the strategy will see this year: sports fee tier (3%/25%), ~2h match
+markets, peak retail flow. Phases compress to catch the group stage:
+
+| Date | Milestone |
+|---|---|
+| Jun 11 | DONE: collector covers all WC markets (ser-fifa x3, tag-based, 60s refresh) |
+| Jun 11 | DONE: engineering gate — WS-first NO book (blocking REST fetch removed); live status monitor (data/live_status.json) |
+| Jun 12-13 | Capture first match days; START dry-run on WC match markets |
+| Jun 14 | Backtest first 2-3 match days (PRO_RATA): fills/match, AS around goals, which line types earn |
+| Jun 15-16 | Go/no-go: $1-2k pilot on group-stage match markets (Phase 2 rules apply) |
+| ~Jun 18 | If pilot clean: scale toward $20k per Phase 3 capture-rate gates |
+
+WC-specific guardrails:
+- Match markets ONLY (winner/draw, O/U, halftime). NO Winner outright
+  (negRisk, locks capital to Jul 20), no exact-score tails (illiquid).
+- In-play goal spikes are the AS stress case — watch unhedged count in
+  live_status.json during matches; kill-switch rules unchanged.
+
+## Wallet & platform readiness checklist (before first --live)
+
+Integration that EXISTS and is wired: credential loading (.env via
+credentials.py, never logged), py-clob-client L2 auth, order place
+(GTC/FAK with explicit order type), cancel, open-orders, positions,
+full ladder maintenance (cancel/replace on drift, 30s reprice floor,
+300s TTL), immediate taker hedge with retry, shutdown cancel-all,
+status monitor. None of it has placed a real order yet.
+
+- [ ] Fund Polymarket account with pilot amount FIRST ($1-2k), not $20k —
+      scale funding with the phase gates
+- [ ] Verify signature_type matches the account type (clob_client uses 1 =
+      email/Magic proxy; MetaMask accounts need 2 + funder address) — test
+      with one $5 order, verify it appears on the Polymarket UI, cancel it
+- [ ] Confirm USDC allowances (UI deposits via proxy normally pre-approve;
+      verify the $5 test order fills/cancels cleanly)
+- [ ] Derive/refresh API creds if the $5 test 401s (scripts/derive_key.py)
+- [ ] Confirm get_positions() matches the UI portfolio page after the test
+
+## Monitoring (live)
+
+- data/live_status.json — refreshed every 30s: mode, total PnL, fills,
+  orders, unhedged count, unroutable count, errors, portfolio cap usage,
+  per-market table. Watch it, tail the console log, or open the
+  Polymarket portfolio page (ground truth for positions/orders/balance).
+- 5-minute STATUS line in the console log.
+- Alerting stack (CloudWatch + local watchdog + on-box cron) covers the
+  data pipeline; the trading process runs on THIS machine under your eyes
+  during the pilot.
+
 ## Decision log
 
 | Date | Decision | Basis |

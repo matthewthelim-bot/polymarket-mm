@@ -717,6 +717,52 @@ async def main_async(args: argparse.Namespace) -> None:
         watcher_thread.start()
         log.info("Universe watcher started (polling every 60s)")
 
+    # ------------------------------------------------------------------
+    # Live status monitor — writes data/live_status.json every 30s and
+    # logs a one-line portfolio summary every 5 min. Watch with:
+    #   py -3 -c "import json,time; [print(json.dumps(json.load(open('data/live_status.json')),indent=1)) or time.sleep(30) for _ in iter(int,1)]"
+    # or any file watcher; Polymarket's portfolio page is ground truth.
+    # ------------------------------------------------------------------
+    status_path = Path("data/live_status.json")
+
+    def _status_thread():
+        log_s = logging.getLogger("status")
+        n = 0
+        while not _thread_stop.wait(timeout=30.0):
+            try:
+                snaps = [lp.snapshot() for lp in loops]
+                agg = {
+                    "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "mode": "LIVE" if args.live else "DRY-RUN",
+                    "markets": len(snaps),
+                    "total_pnl": round(sum(s["pnl"] for s in snaps), 2),
+                    "total_fills": sum(s["fills"] for s in snaps),
+                    "orders_placed": sum(s["orders_placed"] for s in snaps),
+                    "open_unhedged": sum(s["open_unhedged"] for s in snaps),
+                    "unroutable": sum(s["unroutable"] for s in snaps),
+                    "errors": sum(s["errors"] for s in snaps),
+                    "portfolio": portfolio.status(),
+                    "per_market": sorted(snaps, key=lambda s: -abs(s["pnl"]))[:50],
+                }
+                status_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = status_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(agg, indent=1))
+                tmp.replace(status_path)
+                n += 1
+                if n % 10 == 0:  # every ~5 min
+                    log_s.info(
+                        "STATUS %s: pnl=$%.2f fills=%d orders=%d unhedged=%d unroutable=%d errors=%d",
+                        agg["mode"], agg["total_pnl"], agg["total_fills"],
+                        agg["orders_placed"], agg["open_unhedged"],
+                        agg["unroutable"], agg["errors"],
+                    )
+            except Exception as exc:
+                log_s.warning("status write failed: %s", exc)
+
+    status_thread = threading.Thread(target=_status_thread, daemon=True, name="status-monitor")
+    status_thread.start()
+    log.info("Status monitor started -> %s (30s interval)", status_path)
+
     log.info("Book feed started. Waiting for market data...")
     try:
         await stop_event.wait()
