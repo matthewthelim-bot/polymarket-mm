@@ -220,6 +220,7 @@ def make_simulator(market_id: str, days_to_resolution: int = 9999,
                    fee_rate: Optional[float] = None,
                    rebate_frac: Optional[float] = None,
                    queue_model: QueueModel = QueueModel.FRONT,
+                   ladder_offset: Optional[float] = None,
                    ) -> BacktestSimulator:
     """Build a dual-book BacktestSimulator with the standard live parameters.
 
@@ -228,6 +229,7 @@ def make_simulator(market_id: str, days_to_resolution: int = 9999,
     """
     fee_rate = FEE_RATE if fee_rate is None else fee_rate
     rebate_frac = REBATE_FRAC if rebate_frac is None else rebate_frac
+    ladder_offset = LADDER_OFFSET if ladder_offset is None else ladder_offset
     fm = FeeModel()
     meta = MarketMetadata(
         condition_id=market_id, token_id_yes=market_id, token_id_no=market_id,
@@ -244,7 +246,7 @@ def make_simulator(market_id: str, days_to_resolution: int = 9999,
         fv_estimator=FairValueEstimator(twap_window_seconds=3600, external_weight=0.0),
         regime_classifier=RegimeClassifier(),
         hedgeability_assessor=HedgeabilityAssessor(fm, fee_rate, rebate_frac, 0.005),
-        quote_engine=QuoteEngine(fm, fee_rate, rebate_frac, LADDER_OFFSET, 0.005),
+        quote_engine=QuoteEngine(fm, fee_rate, rebate_frac, ladder_offset, 0.005),
         inventory_manager=InventoryManager(market_id, 0.0003),
         pnl_engine=PnLEngine(fm, fee_rate, rebate_frac),
         fill_model=FillModel(FillModelConfig(queue_model=queue_model,
@@ -255,7 +257,7 @@ def make_simulator(market_id: str, days_to_resolution: int = 9999,
             quote_size=quote_size if quote_size is not None else QUOTE_SIZE,
             time_to_resolution_hours=720.0,
             ladder_levels=LADDER_LEVELS,
-            ladder_offset_from_best=LADDER_OFFSET,
+            ladder_offset_from_best=ladder_offset,
             ladder_tick_spacing=LADDER_TICK,
             ladder_size_ratios=LADDER_SIZE_RATIOS,
             price_tolerance=PRICE_TOLERANCE,

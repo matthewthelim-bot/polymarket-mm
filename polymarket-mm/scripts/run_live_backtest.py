@@ -123,6 +123,8 @@ def main():
                         help="Skip EC2 sync and use whatever is in data/live already")
     parser.add_argument("--capital", type=float, default=None,
                         help="Override TOTAL_CAPITAL (default: use script constant)")
+    parser.add_argument("--ladder-offset", type=float, default=None,
+                        help="Override LADDER_OFFSET (L0 distance from best, default 0.030)")
     parser.add_argument("--size-clamp", type=float, default=500.0,
                         help="Max base quote size in contracts (default 500)")
     parser.add_argument("--market-cap", type=float, default=None,
@@ -256,6 +258,7 @@ def main():
             fee_rate=fee_rate,
             rebate_frac=rebate_rate,
             queue_model=QueueModel[args.queue_model],
+            ladder_offset=args.ladder_offset,
         )
         r = sim.run(events)
         results.append((mid, r, avg_ts, qs))
