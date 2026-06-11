@@ -750,6 +750,28 @@ async def main_async(args: argparse.Namespace) -> None:
                 tmp = status_path.with_suffix(".tmp")
                 tmp.write_text(json.dumps(agg, indent=1))
                 tmp.replace(status_path)
+                # Append compact history row (pilot fill-rate analysis input)
+                hist = {k: agg[k] for k in
+                        ("ts", "mode", "total_pnl", "total_fills",
+                         "orders_placed", "open_unhedged", "unroutable", "errors")}
+                with open("data/live_status_history.jsonl", "a") as hf:
+                    hf.write(json.dumps(hist) + "\n")
+                # Automatic kill-switch: cumulative loss beyond the limit ->
+                # cancel everything and stop quoting (positions kept; they are
+                # bounded-loss pairs). Requires human review + restart.
+                if (args.live and args.max_daily_loss > 0
+                        and agg["total_pnl"] <= -args.max_daily_loss):
+                    log_s.critical(
+                        "KILL-SWITCH: PnL $%.2f breached -$%.2f — halting all "
+                        "%d markets", agg["total_pnl"], args.max_daily_loss,
+                        len(loops),
+                    )
+                    for lp in loops:
+                        try:
+                            lp.halt("kill-switch: max daily loss")
+                        except Exception:
+                            log_s.exception("halt failed for %s",
+                                            lp.config.market_id[:40])
                 n += 1
                 if n % 10 == 0:  # every ~5 min
                     log_s.info(
@@ -841,6 +863,11 @@ def main():
                         help="Max fraction of capital lockable in >30-day positions "
                              "(default 0.30). Liquidity guard: keeps the rest of the "
                              "wallet free for fast-recycling short-duration markets.")
+    parser.add_argument("--max-daily-loss", type=float, default=50.0,
+                        help="Kill-switch: halt all quoting and cancel resting "
+                             "orders when cumulative session PnL falls below "
+                             "-N USDC (default 50; 0=disabled). Positions are "
+                             "kept; restart requires human review.")
     parser.add_argument("--max-event-notional", type=float, default=0.0,
                         help="Max USDC per Gamma event group (default 0=disabled). "
                              "When enabled, real event IDs are fetched per market "

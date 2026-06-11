@@ -49,6 +49,37 @@ from src.live.exit_checker import ExitChecker
 logger = logging.getLogger(__name__)
 
 
+class _RestRateLimiter:
+    """Process-wide sliding-window limiter for order place/cancel calls.
+
+    A goal in a soccer match makes ~all markets reprice at once; without a
+    global limiter that's a burst of hundreds of REST calls and a likely
+    API ban. Threads block until a slot frees (bursts serialize, nothing
+    is dropped).
+    """
+
+    def __init__(self, max_per_second: float = 8.0):
+        import collections
+        self.max_per_second = max_per_second
+        self._stamps = collections.deque()
+        self._lock = __import__("threading").Lock()
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._stamps and now - self._stamps[0] > 1.0:
+                    self._stamps.popleft()
+                if len(self._stamps) < self.max_per_second:
+                    self._stamps.append(now)
+                    return
+                wait = 1.0 - (now - self._stamps[0]) + 0.01
+            time.sleep(max(wait, 0.01))
+
+
+REST_RATE_LIMITER = _RestRateLimiter(max_per_second=8.0)
+
+
 @dataclass
 class QuoteLoopConfig:
     """Configuration for one market's quote loop."""
@@ -256,6 +287,7 @@ class QuoteLoop:
 
         self._as_estimate: float = 0.0
         self._last_fv: Optional[float] = None
+        self._halted: bool = False
         self.stats = QuoteLoopStats()
 
     # ------------------------------------------------------------------
@@ -268,6 +300,24 @@ class QuoteLoop:
     # thread for all markets — up to 10s per timeout — exactly when books
     # move fastest (e.g. a goal in a soccer match).
     NO_BOOK_STALE_SECONDS = 30.0
+
+    def halt(self, reason: str) -> None:
+        """Kill-switch: cancel all resting orders and stop quoting.
+
+        Open positions are KEPT (they are bounded-loss pairs); only new
+        quoting stops. Irreversible for the process lifetime by design —
+        a human restarts after reviewing.
+        """
+        if self._halted:
+            return
+        self._halted = True
+        logger.critical("[%s] HALTED: %s — cancelling all resting orders",
+                        self.config.market_id, reason)
+        try:
+            self._cancel_all()
+        except Exception:
+            logger.exception("[%s] cancel_all during halt failed — CHECK THE BOOK",
+                             self.config.market_id)
 
     def snapshot(self) -> dict:
         """JSON-safe operational snapshot for the live status monitor."""
@@ -284,6 +334,7 @@ class QuoteLoop:
             "open_unhedged": len(self._open_positions),
             "unroutable": self.stats.unroutable_fills,
             "errors": self.stats.errors,
+            "halted": self._halted,
             "pnl": round(self.stats.total_pnl, 4),
             "long_notional": round(self._long_notional, 2),
             "short_notional": round(self._short_notional, 2),
@@ -579,6 +630,7 @@ class QuoteLoop:
                 size=size,
                 time_in_force="IOC",
             )
+            REST_RATE_LIMITER.acquire()
             resp = self._client.place_order(req)
             if resp.filled_size > 0:
                 self._record_cycle_pnl(fill_type, maker_price, hedge_price, resp.filled_size)
@@ -690,6 +742,7 @@ class QuoteLoop:
                     size=pos.size,
                     time_in_force="IOC",
                 )
+                REST_RATE_LIMITER.acquire()
                 resp = self._client.place_order(req)
                 if resp.filled_size > 0:
                     self._record_cycle_pnl(pos.fill_type, pos.maker_price, hedge_price, resp.filled_size)
@@ -713,6 +766,8 @@ class QuoteLoop:
 
     def _run_cycle(self) -> None:
         """Compute quotes and maintain all 4 resting orders."""
+        if self._halted:
+            return
         if self._current_yes_book is None or self._current_no_book is None:
             return
 
@@ -955,6 +1010,7 @@ class QuoteLoop:
 
         try:
             req = OrderRequest(token_id=token_id, side=side, price=price, size=size)
+            REST_RATE_LIMITER.acquire()
             resp = self._client.place_order(req)
             self.stats.orders_placed += 1
             logger.info(
@@ -1043,6 +1099,7 @@ class QuoteLoop:
 
         for attempt in (1, 2):
             try:
+                REST_RATE_LIMITER.acquire()
                 ok = self._client.cancel_order(order.order_id)
                 if ok:
                     self.stats.orders_cancelled += 1
