@@ -100,6 +100,51 @@ SERIES_GROUP_SHARDS: dict[str, int] = {
 # Flat list for backwards-compat (fetch_series_markets default)
 TRACKED_SERIES = [s for slugs in SERIES_FEED_GROUPS.values() for s in slugs]
 
+# Tag-based feed groups — for market families with no series slug, discovered
+# via Gamma's tag filter. negRisk events are INCLUDED here (soccer match
+# events are negRisk 3-way groups whose sub-markets are real binary books,
+# unlike the synthetic negRisk series the slug fetcher skips).
+# label -> {"tag_id": Gamma tag id, "shards": connections}
+TAG_FEED_GROUPS: dict[str, dict] = {
+    # 2026 FIFA World Cup — match-day events (winner/draw/O-U/halftime/etc.)
+    # appear day-of like MLB games; group stage = 4-6 matches/day.
+    "ser-fifa": {"tag_id": 102232, "shards": 3},
+}
+
+
+def fetch_tag_markets(tag_id: int) -> list[dict]:
+    """Fetch active markets from all events carrying a Gamma tag.
+
+    Unlike fetch_series_markets, negRisk events are kept — tag groups are
+    curated for families (e.g. World Cup matches) where negRisk sub-markets
+    have genuine order books.
+    """
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    results: list[dict] = []
+    for offset in range(0, 500, 100):
+        url = (
+            f"https://gamma-api.polymarket.com/events"
+            f"?tag_id={tag_id}&closed=false&end_date_min={today}"
+            f"&limit=100&offset={offset}"
+        )
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                events = json.loads(resp.read())
+        except Exception as exc:
+            logger.warning("Tag fetch failed for tag_id=%s: %s", tag_id, exc)
+            break
+        if not events:
+            break
+        for ev in events:
+            for m in ev.get("markets", []):
+                if m.get("active") and not m.get("closed"):
+                    results.append(m)
+        if len(events) < 100:
+            break
+    return results
+
 # ---------------------------------------------------------------------------
 # Buffered file writer
 # ---------------------------------------------------------------------------
@@ -329,6 +374,10 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
         _register_group(group, group_markets,
                         shards=SERIES_GROUP_SHARDS.get(group, 1))
 
+    for group, cfg in TAG_FEED_GROUPS.items():
+        group_markets = fetch_tag_markets(cfg["tag_id"])
+        _register_group(group, group_markets, shards=cfg.get("shards", 1))
+
     logger.info(
         "Feeds: %s",
         "  ".join(f"{lbl}={len(tids)}tok" for lbl, tids in feed_tokens.items()),
@@ -442,6 +491,12 @@ def run_collector(out_dir: str, stats_interval: int, min_volume: float = 5_000.0
                 counts_str = []
                 for group, slugs in SERIES_FEED_GROUPS.items():
                     grp = fetch_series_markets(slugs=slugs)
+                    g_tok, g_side, g_q = build_token_maps(grp)
+                    added += _subscribe_new(group, g_tok, g_side)
+                    new_q.update(g_q)
+                    counts_str.append(f"{group}:{len(grp)}")
+                for group, cfg in TAG_FEED_GROUPS.items():
+                    grp = fetch_tag_markets(cfg["tag_id"])
                     g_tok, g_side, g_q = build_token_maps(grp)
                     added += _subscribe_new(group, g_tok, g_side)
                     new_q.update(g_q)
