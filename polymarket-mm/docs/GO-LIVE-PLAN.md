@@ -194,6 +194,22 @@ status monitor. None of it has placed a real order yet.
   data pipeline; the trading process runs on THIS machine under your eyes
   during the pilot.
 
+## Overnight lessons (2026-06-12, opener night)
+
+1. **Session-managed processes die with the session.** The first dry-run was
+   launched as an assistant background task and silently terminated at 01:18
+   (no crash, no traceback — process lifecycle). Trading processes MUST run
+   as detached OS processes (Start-Process / scheduled task). The relaunched
+   dry-run is detached; the live pilot must be too.
+2. **Exact-score markets slipped into the dry-run universe** — laddering NO
+   bids at 0.83-0.86 ($250/level) on illiquid tails. make_wc_universe now
+   excludes exact-score / futures / first-to-score lines per the pilot
+   guardrails. Watch the next dry-run for any other line types that look
+   wrong.
+3. **Collector handled match night flawlessly**: 2,315 markets on Jun 11,
+   fifa feeds saturated through the match window, healthcheck green hourly,
+   memory stable with swap at ~360MB.
+
 ## Decision log
 
 | Date | Decision | Basis |

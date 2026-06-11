@@ -74,6 +74,16 @@ def main() -> None:
             for m in ev.get("markets", []):
                 if not (m.get("active") and not m.get("closed")):
                     continue
+                # Pilot guardrail (GO-LIVE-PLAN): match winner/draw, O/U and
+                # halftime lines only. Exact-score tails are illiquid one-way
+                # books (observed: dry-run laddering NO bids at 0.83-0.86,
+                # ~$250/level, on "Exact Score 2-1" markets); futures lock
+                # capital to Jul 20.
+                q = (m.get("question", "") or "").lower()
+                if any(x in q for x in ("exact score", "win the 2026",
+                                        "golden boot", "to score first",
+                                        "first team to score")):
+                    continue
                 clob_ids = m.get("clobTokenIds", [])
                 if isinstance(clob_ids, str):
                     clob_ids = json.loads(clob_ids)
