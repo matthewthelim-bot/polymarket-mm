@@ -326,6 +326,8 @@ def load_active_from_universe(universe_path: Path) -> list[dict]:
             "yes_token": m.yes_token,
             "no_token": m.no_token,
             "question": m.question,
+            "slug": m.slug,
+            "end_date": m.end_date,
         }
         for m in u.active_markets()
         if m.ingested
