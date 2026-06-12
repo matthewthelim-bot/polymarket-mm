@@ -180,7 +180,7 @@ status monitor. None of it has placed a real order yet.
       POLY_ADDRESS = the Polymarket PROXY/deposit address (from your
       polymarket.com profile), NOT the MetaMask address.
 - [ ] Run the auth test: py -3 scripts/test_order.py --confirm
-      (places ONE ~\$1.50 GTD bid 20c below best, verifies, cancels;
+      (places ONE ~$1.50 GTD bid 20c below best, verifies, cancels;
       self-destructs in 2 min even if interrupted)
 - [ ] Confirm USDC allowances (UI deposits via proxy normally pre-approve;
       verify the $5 test order fills/cancels cleanly)
