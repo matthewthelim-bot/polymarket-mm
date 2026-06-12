@@ -131,12 +131,18 @@ class ClobClient:
             api_secret=self._creds.poly_api_secret,
             api_passphrase=self._creds.poly_api_passphrase,
         )
+        # signature_type=2: MetaMask/browser-wallet account. PRIVATE_KEY is
+        # the exported MetaMask EOA key; `funder` is the Polymarket PROXY
+        # wallet address (the deposit/profile address on polymarket.com, NOT
+        # the MetaMask address) — POLY_ADDRESS in .env must hold it.
+        # Email/Magic-login accounts would use signature_type=1 instead.
         self._py_client = _PyClobClient(
             host=CLOB_BASE,
             chain_id=POLYGON,
             key=self._creds.private_key,
             creds=api_creds,
-            signature_type=1,   # L2 auth
+            signature_type=2,
+            funder=self._creds.poly_address,
         )
         return self._py_client
 

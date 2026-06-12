@@ -175,9 +175,13 @@ status monitor. None of it has placed a real order yet.
 
 - [ ] Fund Polymarket account with pilot amount FIRST ($1-2k), not $20k —
       scale funding with the phase gates
-- [ ] Verify signature_type matches the account type (clob_client uses 1 =
-      email/Magic proxy; MetaMask accounts need 2 + funder address) — test
-      with one $5 order, verify it appears on the Polymarket UI, cancel it
+- [x] Account type confirmed: MetaMask -> signature_type=2 + funder wired
+      (2026-06-12). PREREQ: .env PRIVATE_KEY = exported MetaMask EOA key;
+      POLY_ADDRESS = the Polymarket PROXY/deposit address (from your
+      polymarket.com profile), NOT the MetaMask address.
+- [ ] Run the auth test: py -3 scripts/test_order.py --confirm
+      (places ONE ~\$1.50 GTD bid 20c below best, verifies, cancels;
+      self-destructs in 2 min even if interrupted)
 - [ ] Confirm USDC allowances (UI deposits via proxy normally pre-approve;
       verify the $5 test order fills/cancels cleanly)
 - [ ] Derive/refresh API creds if the $5 test 401s (scripts/derive_key.py)
